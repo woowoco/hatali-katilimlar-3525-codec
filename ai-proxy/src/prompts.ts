@@ -52,13 +52,34 @@ export function buildSystemPrompt(): string {
     "- READ-ONLY: you are only classifying transactions. You must NEVER trigger charging, NEVER suggest bulk auto-charges, NEVER decide that any group should be auto-billed. The human operator opens each row manually and clicks 'Tümünü ücretlendir' or 'Seçili' to charge — your job ends at producing the keyword-table suggestions.",
     "",
     "Your task — for EACH item, emit exactly ONE annotation:",
-    "1. matchedField: which of the three fields (keyword1 | keyword2 | msgContent) carries the dominant signal.",
-    "2. matchedValue: the literal substring/value you saw (echo the keyword text).",
+    "1. matchedField: which of the three fields (keyword1 | keyword2 | msgContent) carries the dominant signal. See the 'Three-field weighing' rule below — do NOT default to keyword1.",
+    "2. matchedValue: the literal substring/value you saw (echo the keyword text from the field you identified in matchedField).",
     "3. keywordGroup: a short, stable cluster slug in kebab-case ASCII, e.g. 'iptal-cancel', 'odeme-payment', 'wat-prefix', 'unknown'. Items that share the same keywordGroup will appear in the same row in the operator's table. Be CONSISTENT — items with the same intent MUST share the same keywordGroup.",
     "4. suggestedAccountEuId: best-matching customer's acntEuId, OR null if none fits well.",
     "5. suggestedAccountName: best-matching customer name (copy exact from list) OR null.",
     "6. confidence: 'high' (clear keyword/firm overlap), 'medium' (plausible), 'low' (guess).",
-    "7. reasoning: one short Turkish sentence.",
+    "7. reasoning: one short Turkish sentence explaining which field carried the signal and why this firm.",
+    "",
+    "Three-field weighing (CRITICAL — this is the most common mistake):",
+    "Each item has up to THREE independent text fields: keyword1, keyword2, msgContent.",
+    "The DISTINGUISHING keyword — the one that actually picks the firm — may live in ANY of the three.",
+    "Do NOT default to keyword1 just because it's first. A naive 'keyword1 wins' rule causes wrong-firm",
+    "routings when keyword1 is a generic Turkish verb that appears across many intents.",
+    "",
+    "Examples of the failure mode:",
+    "  - keyword1='IPTAL', keyword2='AKTIFBANK'    → 'AKTIFBANK' is the firm marker. 'IPTAL' is generic.",
+    "  - keyword1='IPTAL', keyword2='GARANTI'       → 'GARANTI' is the firm marker. 'IPTAL' is generic.",
+    "  - keyword1='EVET',   keyword2='IPTAL'        → if a row already exists for 'EVET', the SECOND",
+    "                                               keyword (here 'IPTAL') may carry the actual intent",
+    "                                               (e.g. cancel flow for a specific firm).",
+    "  - keyword1='IPTAL', msgContent='AKTIFBANK IPTAL ONAY' → 'AKTIFBANK' in msgContent dominates.",
+    "  - keyword1='IPTAL', keyword2='IPTAL', msgContent='AKTIFBANK' → 'AKTIFBANK' in msgContent dominates.",
+    "",
+    "Decision rule: pick the field whose value NARROWS DOWN the firm the most. If keyword1 looks",
+    "generic (a common verb like IPTAL/EVET/ODEME/HAYIR, a single-character or punctuation value),",
+    "the distinguishing signal is probably in keyword2 or msgContent. Read all three before deciding.",
+    "Use matchedValue to echo the LITERAL text from the chosen field (so the operator can see what",
+    "the AI latched onto when reviewing).",
     "",
     "Strict rules:",
     "- Cover EVERY input item exactly once. Missing items = a hard error.",
@@ -67,6 +88,8 @@ export function buildSystemPrompt(): string {
     "- keywordGroup must be ASCII kebab-case (a-z, 0-9, '-'). NO Turkish characters, NO spaces.",
     "- Be conservative with 'high' confidence. An operator must agree.",
     "- For garbage/system messages (e.g. keyword1 = '.', random punctuation), still emit a record but use keywordGroup='unknown' and suggestedAccountEuId=null.",
+    "- matchedField must reflect the field that ACTUALLY carried the distinguishing signal — not the",
+    "  first non-empty one. The operator relies on this column to spot wrong routings.",
   ].join("\n");
 }
 
@@ -113,7 +136,32 @@ export function buildUserPrompt(
  * Render an override list as a prompt fragment the AI can follow.
  * Empty list → "". Caller skips injection when empty.
  *
- * Each rule carries `matchMode`:
+ * Format chosen to mirror the operator's own Excel/TSV paste:
+ *
+ *     FİRMA        KEYWORD1   KEYWORD2   KEYWORD3   NOT                              MOD
+ *     AKTIFBANK    EVET       ptt        kredi     Customer listesindeki AKTIFBANK   İçerir
+ *     YKB          —          evet       —         Onay SMS'leri                     İçerir
+ *
+ * Rendering rules (driven by the operator's feedback):
+ *
+ *   - Empty KEYWORD columns (Keyword1/2/3) are OMITTED from the prompt
+ *     entirely — we do NOT send `—` placeholders. The model is told
+ *     "only the listed keywords are signals for this firm". This
+ *     prevents a rule like "Firma=KW1 only" from confusing the AI
+ *     into thinking KEYWORD2/3 are also triggers.
+ *   - Empty MOD falls back to `İçerir` (default match mode).
+ *   - Empty NOT is also omitted from the row, but the column header
+ *     stays in place so the AI knows the column exists.
+ *   - Firm column always carries the operator-typed accountName
+ *     verbatim — this is the literal routing target.
+ *   - If accountName didn't resolve to a customer (acntEuId === null)
+ *     we annotate "(müşteri listesinde yok)" but still emit the row;
+ *     the model will still suggest that name and the operator will
+ *     see the firm-unknown warning in the UI.
+ *   - Rules whose keywords array is entirely empty are dropped
+ *     outright — they would just be a bare firm name.
+ *
+ * Each emitted rule carries `matchMode`:
  *   - "contains" (default): case-insensitive substring match against
  *     keyword1/keyword2/msgContent.
  *   - "exact": case-insensitive, character-for-character equality
@@ -127,47 +175,54 @@ export function buildUserPrompt(
  * only steer the suggestion; they never trigger a charge by themselves.
  */
 function buildOverrideFragment(overrides: KeywordOverride[]): string {
-  const contains = overrides.filter((o) => (o.matchMode ?? "contains") === "contains");
-  const exact = overrides.filter((o) => o.matchMode === "exact");
+  // Drop rules with no keywords at all — they would just be a "FİRMA"
+  // row with no signals for the AI.
+  const usable = overrides.filter((o) =>
+    o.keywords.some((k) => k.trim()),
+  );
+  if (usable.length === 0) return "";
 
   const lines: string[] = [
-    "OVERRIDE RULES — operator-maintained suggestions. You NEVER charge; you only SUGGEST.",
-    "If an item matches any rule below, set suggestedAccountEuId + suggestedAccountName from that rule (and reflect the matched keyword in matchedValue / matchedField).",
-    "These are SUGGESTIONS the operator will review manually — you must not skip suggesting matches because you 'think they're obvious'.",
-    "If an item matches NO override rule, fall back to your normal customer-list reasoning.",
+    "OVERRIDE RULES — operator-maintained routing table.",
+    "Each row = FİRMA → KEYWORD1 → KEYWORD2 → KEYWORD3 → NOT → MOD.",
+    "A row's KEYWORD columns are the ONLY signals for that FİRMA. If an item's keyword1/keyword2/msgContent contains any KEYWORD (per MOD semantics), suggest that FİRMA — even if your own customer-list reasoning would route it elsewhere.",
+    "Empty KEYWORD columns are intentionally NOT emitted — treat the row as having only the listed keywords. Do not invent matches in unlisted columns.",
+    "These are SUGGESTIONS the operator reviews manually — you NEVER auto-charge.",
     "",
   ];
 
-  if (contains.length > 0) {
-    lines.push("--- Contains rules (case-insensitive substring match) ---");
-    for (const ov of contains) {
-      const kws = ov.keywords.map((k) => `  - "${k}"`).join("\n");
-      const acnt = ov.acntEuId
-        ? `acntEuId=${ov.acntEuId}`
-        : `(firm not in current customer list — still suggest this accountName)`;
-      lines.push(`→ SUGGEST accountName: "${ov.accountName}" (${acnt})`);
-      lines.push(`  match if ANY of these substrings appears in keyword1, keyword2, or msgContent (case-insensitive):`);
-      lines.push(kws);
-      lines.push("");
+  for (const ov of usable) {
+    const kws = ov.keywords.map((k) => k.trim()).filter(Boolean);
+    const mode = ov.matchMode === "exact" ? "Tam" : "İçerir"; // empty → fallback
+    const acntSuffix = ov.acntEuId
+      ? ""
+      : " (müşteri listesinde yok — yine de öner, chargeOnce throw eder)";
+    const not = (ov.notes ?? "").trim();
+
+    // Build the row parts in order. Empty keyword columns are omitted
+    // (no "—" placeholder) so the AI doesn't get false-positive signals.
+    const parts: string[] = [`FİRMA: ${ov.accountName}${acntSuffix}`];
+    parts.push(`KEYWORD1: ${kws[0]}`);
+    if (kws[1]) parts.push(`KEYWORD2: ${kws[1]}`);
+    if (kws[2]) parts.push(`KEYWORD3: ${kws[2]}`);
+    if (kws.length > 3) {
+      // Edge case: operator pasted >3 keywords. Append the rest so
+      // nothing is lost — they go under KEYWORD3 with a separator.
+      parts.push(
+        `KEYWORD3+: ${kws.slice(2).join(" / ")}`,
+      );
     }
+    if (not) parts.push(`NOT: ${not}`);
+    parts.push(`MOD: ${mode}`);
+
+    lines.push(parts.join(" | "));
   }
 
-  if (exact.length > 0) {
-    lines.push("--- Exact rules (whole-field match after trim, case-insensitive) ---");
-    lines.push("These require the field value to be CHARACTER-FOR-CHARACTER equal to one of the keywords (after trimming whitespace).");
-    lines.push("Do NOT match if the keyword is embedded in a longer string — only if the entire keyword1 OR keyword2 OR msgContent equals one of them.");
-    lines.push("");
-    for (const ov of exact) {
-      const kws = ov.keywords.map((k) => `  - "${k}"`).join("\n");
-      const acnt = ov.acntEuId
-        ? `acntEuId=${ov.acntEuId}`
-        : `(firm not in current customer list — still suggest this accountName)`;
-      lines.push(`→ SUGGEST accountName: "${ov.accountName}" (${acnt})`);
-      lines.push(`  match if keyword1 === one of these (after trim, case-insensitive):`);
-      lines.push(kws);
-      lines.push("");
-    }
-  }
+  // Tail note about the mode semantics — needed once, not per row.
+  lines.push("");
+  lines.push(
+    "MOD semantics: 'İçerir' = case-insensitive substring match against keyword1/keyword2/msgContent; 'Tam' = whole-field equality after trim (case-insensitive).",
+  );
 
   return lines.join("\n");
 }
@@ -204,8 +259,9 @@ export const ITEM_ANNOTATIONS_TOOL = {
                 "ASCII kebab-case cluster name. Same intent = same name across the whole batch.",
             },
             suggestedAccountEuId: {
-              type: "string",
-              description: "Best-matching acntEuId, or null.",
+              type: ["string", "null"],
+              description:
+                "Best-matching acntEuId (UUID string), or JSON null if no customer in the list is a good fit. MUST be JSON null — not the 4-character string \"null\".",
             },
             suggestedAccountName: {
               type: "string",
@@ -279,8 +335,8 @@ export function validateMatches(
       matchedField,
       matchedValue: m.matchedValue ?? "",
       keywordGroup: normalizeGroup(m.keywordGroup),
-      suggestedAccountEuId: m.suggestedAccountEuId ?? null,
-      suggestedAccountName: m.suggestedAccountName ?? null,
+      suggestedAccountEuId: sanitizeAccountEuId(m.suggestedAccountEuId),
+      suggestedAccountName: sanitizeAccountName(m.suggestedAccountName),
       confidence: m.confidence ?? "low",
       reasoning: m.reasoning ?? "",
     });
@@ -310,6 +366,38 @@ function normalizeGroup(g: string | undefined): string {
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "")
     .slice(0, 64) || "unknown";
+}
+
+/**
+ * Coerce an `accountEuId`-shaped LLM response to either a clean UUID
+ * string or JS null. The LLM has been seen to emit:
+ *   - the JSON null literal            → keep as null (good)
+ *   - the STRING "null"                → coerce to null (LLM misread the schema)
+ *   - empty string / whitespace-only   → coerce to null
+ *   - a string with surrounding spaces → trim
+ *   - anything else                    → keep as-is (operator-side resolveFirm
+ *                                       still re-validates with a stricter
+ *                                       `sanitizeAccountEuId`)
+ */
+function sanitizeAccountEuId(v: unknown): string | null {
+  if (v == null) return null;
+  if (typeof v !== "string") return null;
+  const trimmed = v.trim();
+  if (trimmed === "" || trimmed === "null") return null;
+  return trimmed;
+}
+
+/**
+ * Same shape as `sanitizeAccountEuId` but for the human-readable firm
+ * name. Empty strings / whitespace / literal "null" become null. The
+ * downstream UI uses `?? "Codec"` as a fallback for display only.
+ */
+function sanitizeAccountName(v: unknown): string | null {
+  if (v == null) return null;
+  if (typeof v !== "string") return null;
+  const trimmed = v.trim();
+  if (trimmed === "" || trimmed === "null") return null;
+  return trimmed;
 }
 
 // Re-export the fallback constants so callers can use them without diving into types.

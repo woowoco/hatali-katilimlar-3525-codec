@@ -234,4 +234,127 @@ describe("validateMatches", () => {
     const cleaned = validateMatches(raw, items);
     expect(cleaned[0].matchedField).toBe("keyword1");
   });
+
+  // ---------------------------------------------------------------------
+  // Regression: the LLM has been seen to emit the LITERAL STRING "null"
+  // (4 characters, JSON-encoded as `"null"`) in place of the JSON null
+  // for `suggestedAccountEuId`. The tool schema now permits `["string",
+  // "null"]`, but a future schema change could regress — so we also
+  // coerce here. The downstream extension's `buildKeywordRows` filters
+  // via strict `=== null`, so coerced-as-null entries land in the Codec
+  // fallback bucket rather than slipping through as a regular row with
+  // accountEuId=`"null"`.
+  // ---------------------------------------------------------------------
+
+  it('coerces literal string "null" → null for suggestedAccountEuId', () => {
+    const raw: ItemMatch[] = [
+      {
+        transactionId: 1,
+        matchedField: "keyword1",
+        matchedValue: "IPTAL",
+        keywordGroup: "iptal",
+        suggestedAccountEuId: "null" as unknown as null,
+        suggestedAccountName: "Firm A",
+        confidence: "low",
+        reasoning: "",
+      },
+      {
+        transactionId: 2,
+        matchedField: "keyword1",
+        matchedValue: "ODEME",
+        keywordGroup: "odeme",
+        suggestedAccountEuId: null,
+        suggestedAccountName: null,
+        confidence: "low",
+        reasoning: "",
+      },
+      {
+        transactionId: 3,
+        matchedField: "keyword1",
+        matchedValue: ".",
+        keywordGroup: "unknown",
+        suggestedAccountEuId: null,
+        suggestedAccountName: null,
+        confidence: "low",
+        reasoning: "",
+      },
+    ];
+    const cleaned = validateMatches(raw, items);
+    expect(cleaned[0].suggestedAccountEuId).toBeNull();
+  });
+
+  it("coerces empty-string + whitespace suggestedAccountEuId → null", () => {
+    const raw: ItemMatch[] = [
+      {
+        transactionId: 1,
+        matchedField: "keyword1",
+        matchedValue: "X",
+        keywordGroup: "x",
+        suggestedAccountEuId: "" as unknown as null,
+        suggestedAccountName: null,
+        confidence: "low",
+        reasoning: "",
+      },
+      {
+        transactionId: 2,
+        matchedField: "keyword1",
+        matchedValue: "Y",
+        keywordGroup: "y",
+        suggestedAccountEuId: null,
+        suggestedAccountName: null,
+        confidence: "low",
+        reasoning: "",
+      },
+      {
+        transactionId: 3,
+        matchedField: "keyword1",
+        matchedValue: "Z",
+        keywordGroup: "z",
+        suggestedAccountEuId: null,
+        suggestedAccountName: null,
+        confidence: "low",
+        reasoning: "",
+      },
+    ];
+    const cleaned = validateMatches(raw, items);
+    expect(cleaned[0].suggestedAccountEuId).toBeNull();
+    expect(cleaned[1].suggestedAccountEuId).toBeNull();
+  });
+
+  it('coerces literal "null" string for suggestedAccountName → null', () => {
+    const raw: ItemMatch[] = [
+      {
+        transactionId: 1,
+        matchedField: "keyword1",
+        matchedValue: "X",
+        keywordGroup: "x",
+        suggestedAccountEuId: "acc-1",
+        suggestedAccountName: "null" as unknown as null,
+        confidence: "low",
+        reasoning: "",
+      },
+      {
+        transactionId: 2,
+        matchedField: "keyword1",
+        matchedValue: "Y",
+        keywordGroup: "y",
+        suggestedAccountEuId: null,
+        suggestedAccountName: null,
+        confidence: "low",
+        reasoning: "",
+      },
+      {
+        transactionId: 3,
+        matchedField: "keyword1",
+        matchedValue: "Z",
+        keywordGroup: "z",
+        suggestedAccountEuId: null,
+        suggestedAccountName: null,
+        confidence: "low",
+        reasoning: "",
+      },
+    ];
+    const cleaned = validateMatches(raw, items);
+    expect(cleaned[0].suggestedAccountName).toBeNull();
+  });
 });
