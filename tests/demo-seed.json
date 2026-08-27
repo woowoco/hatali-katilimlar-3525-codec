@@ -1,0 +1,72 @@
+{
+  "settings.v1": {
+    "sessionId": "demo",
+    "proxyUrl": "http://localhost:8787",
+    "model": "demo",
+    "throttleMs": 200
+  },
+  "session.v1": {
+    "customers": [
+      { "name": "AKTIF-BANK ---- Aktif Bank", "acntEuId": "aaaaaaaa-0000-0000-0000-000000000001" },
+      { "name": "GARANTI ---- Garanti Bankası", "acntEuId": "bbbbbbbb-0000-0000-0000-000000000002" }
+    ],
+    "items": [
+      { "transactionId": 1001, "phone": "5550001001", "keyword1": "IPTAL", "keyword2": "", "msgContent": "Abonelik iptal", "shortCode": "3525", "msgDate": "2026-08-20T10:00:00", "id": "1001|20.08.2026 10:00:00" },
+      { "transactionId": 1002, "phone": "5550001002", "keyword1": "IPTAL", "keyword2": "", "msgContent": "Abonelik iptal", "shortCode": "3525", "msgDate": "2026-08-20T10:01:00", "id": "1002|20.08.2026 10:01:00" },
+      { "transactionId": 1003, "phone": "5550001003", "keyword1": "IPTAL", "keyword2": "", "msgContent": "Iptal etmek istiyorum", "shortCode": "3525", "msgDate": "2026-08-20T10:02:00", "id": "1003|20.08.2026 10:02:00" },
+      { "transactionId": 1004, "phone": "5550001004", "keyword1": "IPTAL", "keyword2": "", "msgContent": "Iptal", "shortCode": "3525", "msgDate": "2026-08-20T10:03:00", "id": "1004|20.08.2026 10:03:00" },
+      { "transactionId": 1005, "phone": "5550001005", "keyword1": "IPTAL", "keyword2": "", "msgContent": "Lutfen iptal", "shortCode": "3525", "msgDate": "2026-08-20T10:04:00", "id": "1005|20.08.2026 10:04:00" },
+      { "transactionId": 1006, "phone": "5550001006", "keyword1": "IPTAL", "keyword2": "", "msgContent": "Iptal talebi", "shortCode": "3525", "msgDate": "2026-08-20T10:05:00", "id": "1006|20.08.2026 10:05:00" },
+      { "transactionId": 1007, "phone": "5550001007", "keyword1": "IPTAL", "keyword2": "", "msgContent": "Abonelikten cikmak", "shortCode": "3525", "msgDate": "2026-08-20T10:06:00", "id": "1007|20.08.2026 10:06:00" },
+      { "transactionId": 1008, "phone": "5550001008", "keyword1": "IPTAL", "keyword2": "", "msgContent": "Iptal ediniz", "shortCode": "3525", "msgDate": "2026-08-20T10:07:00", "id": "1008|20.08.2026 10:07:00" },
+      { "transactionId": 2001, "phone": "5550002001", "keyword1": "ODEME", "keyword2": "", "msgContent": "Odeme geri al", "shortCode": "3525", "msgDate": "2026-08-20T10:10:00", "id": "2001|20.08.2026 10:10:00" },
+      { "transactionId": 2002, "phone": "5550002002", "keyword1": "ODEME", "keyword2": "", "msgContent": "Odeme iade", "shortCode": "3525", "msgDate": "2026-08-20T10:11:00", "id": "2002|20.08.2026 10:11:00" },
+      { "transactionId": 2003, "phone": "5550002003", "keyword1": "ODEME", "keyword2": "", "msgContent": "Para iadesi", "shortCode": "3525", "msgDate": "2026-08-20T10:12:00", "id": "2003|20.08.2026 10:12:00" },
+      { "transactionId": 2004, "phone": "5550002004", "keyword1": "ODEME", "keyword2": "", "msgContent": "Geri odeme talebi", "shortCode": "3525", "msgDate": "2026-08-20T10:13:00", "id": "2004|20.08.2026 10:13:00" },
+      { "transactionId": 2005, "phone": "5550002005", "keyword1": "ODEME", "keyword2": "", "msgContent": "Iade istiyorum", "shortCode": "3525", "msgDate": "2026-08-20T10:14:00", "id": "2005|20.08.2026 10:14:00" },
+      { "transactionId": 2006, "phone": "5550002006", "keyword1": "ODEME", "keyword2": "", "msgContent": "Ucret iadesi", "shortCode": "3525", "msgDate": "2026-08-20T10:15:00", "id": "2006|20.08.2026 10:15:00" },
+      { "transactionId": 3001, "phone": "5550003001", "keyword1": "BILGI", "keyword2": "", "msgContent": "Bilgi almak istiyorum", "shortCode": "3525", "msgDate": "2026-08-20T10:20:00", "id": "3001|20.08.2026 10:20:00" },
+      { "transactionId": 3002, "phone": "5550003002", "keyword1": "BILGI", "keyword2": "", "msgContent": "Detay verin", "shortCode": "3525", "msgDate": "2026-08-20T10:21:00", "id": "3002|20.08.2026 10:21:00" },
+      { "transactionId": 3003, "phone": "5550003003", "keyword1": "BILGI", "keyword2": "", "msgContent": "Hesap bilgisi", "shortCode": "3525", "msgDate": "2026-08-20T10:22:00", "id": "3003|20.08.2026 10:22:00" },
+      { "transactionId": 3004, "phone": "5550003004", "keyword1": "BILGI", "keyword2": "", "msgContent": "Bilgi", "shortCode": "3525", "msgDate": "2026-08-20T10:23:00", "id": "3004|20.08.2026 10:23:00" },
+      { "transactionId": 4001, "phone": "5550004001", "keyword1": "HATA", "keyword2": "", "msgContent": "Hata aldim", "shortCode": "3525", "msgDate": "2026-08-20T10:30:00", "id": "4001|20.08.2026 10:30:00" },
+      { "transactionId": 4002, "phone": "5550004002", "keyword1": "HATA", "keyword2": "", "msgContent": "Yanlis ucretlendirme", "shortCode": "3525", "msgDate": "2026-08-20T10:31:00", "id": "4002|20.08.2026 10:31:00" },
+      { "transactionId": 4003, "phone": "5550004003", "keyword1": "HATA", "keyword2": "", "msgContent": "Itiraz", "shortCode": "3525", "msgDate": "2026-08-20T10:32:00", "id": "4003|20.08.2026 10:32:00" },
+      { "transactionId": 5001, "phone": "5550005001", "keyword1": ".", "keyword2": "", "msgContent": "", "shortCode": "3525", "msgDate": "2026-08-20T10:40:00", "id": "5001|20.08.2026 10:40:00" },
+      { "transactionId": 5002, "phone": "5550005002", "keyword1": "", "keyword2": "", "msgContent": "???", "shortCode": "3525", "msgDate": "2026-08-20T10:41:00", "id": "5002|20.08.2026 10:41:00" },
+      { "transactionId": 5003, "phone": "5550005003", "keyword1": "x", "keyword2": "", "msgContent": "", "shortCode": "3525", "msgDate": "2026-08-20T10:42:00", "id": "5003|20.08.2026 10:42:00" }
+    ],
+    "matches": [
+      { "transactionId": 1001, "matchedField": "keyword1", "matchedValue": "IPTAL", "keywordGroup": "iptal", "suggestedAccountEuId": "aaaaaaaa-0000-0000-0000-000000000001", "suggestedAccountName": "AKTIF-BANK", "confidence": "high", "reasoning": "" },
+      { "transactionId": 1002, "matchedField": "keyword1", "matchedValue": "IPTAL", "keywordGroup": "iptal", "suggestedAccountEuId": "aaaaaaaa-0000-0000-0000-000000000001", "suggestedAccountName": "AKTIF-BANK", "confidence": "high", "reasoning": "" },
+      { "transactionId": 1003, "matchedField": "msgContent", "matchedValue": "Iptal etmek istiyorum", "keywordGroup": "iptal", "suggestedAccountEuId": "aaaaaaaa-0000-0000-0000-000000000001", "suggestedAccountName": "AKTIF-BANK", "confidence": "medium", "reasoning": "" },
+      { "transactionId": 1004, "matchedField": "keyword1", "matchedValue": "IPTAL", "keywordGroup": "iptal", "suggestedAccountEuId": "aaaaaaaa-0000-0000-0000-000000000001", "suggestedAccountName": "AKTIF-BANK", "confidence": "high", "reasoning": "" },
+      { "transactionId": 1005, "matchedField": "keyword1", "matchedValue": "IPTAL", "keywordGroup": "iptal", "suggestedAccountEuId": "aaaaaaaa-0000-0000-0000-000000000001", "suggestedAccountName": "AKTIF-BANK", "confidence": "high", "reasoning": "" },
+      { "transactionId": 1006, "matchedField": "keyword1", "matchedValue": "IPTAL", "keywordGroup": "iptal", "suggestedAccountEuId": "aaaaaaaa-0000-0000-0000-000000000001", "suggestedAccountName": "AKTIF-BANK", "confidence": "high", "reasoning": "" },
+      { "transactionId": 1007, "matchedField": "msgContent", "matchedValue": "Abonelikten cikmak", "keywordGroup": "iptal", "suggestedAccountEuId": "aaaaaaaa-0000-0000-0000-000000000001", "suggestedAccountName": "AKTIF-BANK", "confidence": "medium", "reasoning": "" },
+      { "transactionId": 1008, "matchedField": "keyword1", "matchedValue": "IPTAL", "keywordGroup": "iptal", "suggestedAccountEuId": "aaaaaaaa-0000-0000-0000-000000000001", "suggestedAccountName": "AKTIF-BANK", "confidence": "high", "reasoning": "" },
+      { "transactionId": 2001, "matchedField": "keyword1", "matchedValue": "ODEME", "keywordGroup": "odeme", "suggestedAccountEuId": "bbbbbbbb-0000-0000-0000-000000000002", "suggestedAccountName": "GARANTI", "confidence": "high", "reasoning": "" },
+      { "transactionId": 2002, "matchedField": "keyword1", "matchedValue": "ODEME", "keywordGroup": "odeme", "suggestedAccountEuId": "bbbbbbbb-0000-0000-0000-000000000002", "suggestedAccountName": "GARANTI", "confidence": "high", "reasoning": "" },
+      { "transactionId": 2003, "matchedField": "msgContent", "matchedValue": "Para iadesi", "keywordGroup": "odeme", "suggestedAccountEuId": "bbbbbbbb-0000-0000-0000-000000000002", "suggestedAccountName": "GARANTI", "confidence": "high", "reasoning": "" },
+      { "transactionId": 2004, "matchedField": "msgContent", "matchedValue": "Geri odeme talebi", "keywordGroup": "odeme", "suggestedAccountEuId": "bbbbbbbb-0000-0000-0000-000000000002", "suggestedAccountName": "GARANTI", "confidence": "medium", "reasoning": "" },
+      { "transactionId": 2005, "matchedField": "msgContent", "matchedValue": "Iade istiyorum", "keywordGroup": "odeme", "suggestedAccountEuId": "bbbbbbbb-0000-0000-0000-000000000002", "suggestedAccountName": "GARANTI", "confidence": "low", "reasoning": "" },
+      { "transactionId": 2006, "matchedField": "msgContent", "matchedValue": "Ucret iadesi", "keywordGroup": "odeme", "suggestedAccountEuId": "bbbbbbbb-0000-0000-0000-000000000002", "suggestedAccountName": "GARANTI", "confidence": "medium", "reasoning": "" },
+      { "transactionId": 3001, "matchedField": "keyword1", "matchedValue": "BILGI", "keywordGroup": "bilgi", "suggestedAccountEuId": "aaaaaaaa-0000-0000-0000-000000000001", "suggestedAccountName": "AKTIF-BANK", "confidence": "high", "reasoning": "" },
+      { "transactionId": 3002, "matchedField": "msgContent", "matchedValue": "Detay verin", "keywordGroup": "bilgi", "suggestedAccountEuId": "aaaaaaaa-0000-0000-0000-000000000001", "suggestedAccountName": "AKTIF-BANK", "confidence": "medium", "reasoning": "" },
+      { "transactionId": 3003, "matchedField": "msgContent", "matchedValue": "Hesap bilgisi", "keywordGroup": "bilgi", "suggestedAccountEuId": "aaaaaaaa-0000-0000-0000-000000000001", "suggestedAccountName": "AKTIF-BANK", "confidence": "medium", "reasoning": "" },
+      { "transactionId": 3004, "matchedField": "keyword1", "matchedValue": "BILGI", "keywordGroup": "bilgi", "suggestedAccountEuId": "aaaaaaaa-0000-0000-0000-000000000001", "suggestedAccountName": "AKTIF-BANK", "confidence": "high", "reasoning": "" },
+      { "transactionId": 4001, "matchedField": "keyword1", "matchedValue": "HATA", "keywordGroup": "hata", "suggestedAccountEuId": null, "suggestedAccountName": null, "confidence": "low", "reasoning": "" },
+      { "transactionId": 4002, "matchedField": "msgContent", "matchedValue": "Yanlis ucretlendirme", "keywordGroup": "hata", "suggestedAccountEuId": null, "suggestedAccountName": null, "confidence": "low", "reasoning": "" },
+      { "transactionId": 4003, "matchedField": "msgContent", "matchedValue": "Itiraz", "keywordGroup": "hata", "suggestedAccountEuId": null, "suggestedAccountName": null, "confidence": "low", "reasoning": "" },
+      { "transactionId": 5001, "matchedField": "keyword1", "matchedValue": ".", "keywordGroup": "unknown", "suggestedAccountEuId": null, "suggestedAccountName": null, "confidence": "low", "reasoning": "" },
+      { "transactionId": 5002, "matchedField": "msgContent", "matchedValue": "???", "keywordGroup": "unknown", "suggestedAccountEuId": null, "suggestedAccountName": null, "confidence": "low", "reasoning": "" },
+      { "transactionId": 5003, "matchedField": "keyword1", "matchedValue": "x", "keywordGroup": "unknown", "suggestedAccountEuId": null, "suggestedAccountName": null, "confidence": "low", "reasoning": "" }
+    ],
+    "model": "demo",
+    "fetchedAt": "2026-08-20T10:00:00",
+    "chargedIds": [],
+    "ignoredIds": [],
+    "firmOverrides": {},
+    "txFirmOverrides": {}
+  }
+}

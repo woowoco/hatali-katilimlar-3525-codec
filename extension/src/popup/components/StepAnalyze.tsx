@@ -167,7 +167,7 @@ export function StepAnalyze() {
             setBatchStartedAt(Date.now());
           }
         },
-        { signal: controller.signal },
+        { signal: controller.signal, demoMode: settings.demoMode },
       );
 
       const batchList = progress

@@ -1,7 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { Plus, Trash2, Save, FileText, AlertCircle } from "lucide-react";
 import { loadOverrides, saveOverrides } from "../../lib/store.js";
-import { parseOverrideBulk } from "../../lib/overrideParser.js";
+import {
+  parseOverrideBulk,
+  previewOverrideBulk,
+  type PreviewRow,
+  type PreviewStatus,
+} from "../../lib/overrideParser.js";
 import type { Customer, KeywordOverride, OverrideMatchMode } from "../../types.js";
 
 /**
@@ -112,6 +117,47 @@ export function OverrideEditor({ customers }: { customers: Customer[] }) {
     [list],
   );
 
+  // Excel-style live preview of the bulk textarea. Re-runs whenever the
+  // operator edits the textarea, so they can paste an Excel range, see
+  // exactly which rows will be imported and which will be rejected, and
+  // only then click "Ekle". Empty / whitespace-only input → empty
+  // preview (previewOverrideBulk already returns an empty result).
+  const preview = useMemo(
+    () => previewOverrideBulk(bulkText, customers),
+    [bulkText, customers],
+  );
+
+  const previewActive = bulkText.trim().length > 0;
+
+  const statusBadge = (row: PreviewRow) => {
+    const meta: Record<PreviewStatus, { label: string; cls: string }> = {
+      ok: { label: "✓ İçe aktarılacak", cls: "ok" },
+      "firm-unknown": { label: "⚠ firma listede yok", cls: "warn" },
+      "no-firm": { label: "✗ firma yok", cls: "err" },
+      "no-keywords": { label: "✗ keyword yok", cls: "err" },
+      error: { label: "✗ parse hatası", cls: "err" },
+    };
+    const m = meta[row.status] ?? meta.error;
+    return (
+      <span className={`override-preview__badge override-preview__badge--${m.cls}`} title={row.statusMessage}>
+        {m.label}
+      </span>
+    );
+  };
+
+  // Tek bir keyword hücresini render et. Boşsa görsel placeholder
+  // (`—` italic muted) göster — operatör Excel'deki boş sütunu
+  // tabloda net görsün, "yok mu sayıldı?" sorusunu sormasın.
+  const renderKeywordCell = (cells: string[], idx: number) => {
+    const v = cells[idx];
+    if (v === undefined || v === null || v === "") {
+      return (
+        <td className="muted" style={{ textAlign: "center" }}>—</td>
+      );
+    }
+    return <td>{v}</td>;
+  };
+
   if (!loaded) return null;
 
   return (
@@ -140,6 +186,70 @@ export function OverrideEditor({ customers }: { customers: Customer[] }) {
           placeholder={`# Pipe formatı: Firma | kw1, kw2, kw3 | not | mod\nAktif Bank | aktif, aktifbank | Kargo/EFT | içerir\nAktif Bank | EVET | Kredi onayı | tam\n\n# Excel'den kopyala-yapıştır (CSV/TSV otomatik tespit):\nFirma\tKeyword1\tKeyword2\tNot\tMod\nAktif Bank\tPTT\tEVET\tKargo bildirimleri\ttam\nAktif Bank\taktifbank\tHAYIR\tKredi geri ödemesi\ticerir`}
           spellCheck={false}
         />
+
+        {previewActive && (
+          <div className="override-preview">
+            <div className="override-preview__head">
+              <span className="muted" style={{ fontSize: 10 }}>
+                Önizleme · format: {preview.format.toUpperCase()}
+              </span>
+              <span className="override-preview__counts">
+                <span className="ok">{preview.okCount} ✓</span>
+                <span className="warn">{preview.warnCount} ⚠</span>
+                <span className="err">{preview.errorCount} ✗</span>
+              </span>
+            </div>
+            {preview.rows.length > 0 && (
+              <table className="override-preview__table">
+                <thead>
+                  <tr>
+                    <th style={{ width: 28 }}>#</th>
+                    <th>Durum</th>
+                    <th>Firma</th>
+                    <th>Keyword1</th>
+                    <th>Keyword2</th>
+                    <th>Keyword3</th>
+                    <th>Not</th>
+                    <th>Mod</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {preview.rows.map((r, i) =>
+                    r.kind === "header" ? (
+                      <tr key={`row-${i}`} className="override-preview__row--header">
+                        <td>{r.sourceLine}</td>
+                        <td colSpan={7} className="muted">
+                          başlık satırı — atlanır
+                        </td>
+                      </tr>
+                    ) : (
+                      <tr
+                        key={`row-${i}`}
+                        className={`override-preview__row override-preview__row--${r.status}`}
+                      >
+                        <td>{r.sourceLine}</td>
+                        <td>{statusBadge(r)}</td>
+                        <td>{r.accountName || <em className="muted">(boş)</em>}</td>
+                        {renderKeywordCell(r.keywordCells, 0)}
+                        {renderKeywordCell(r.keywordCells, 1)}
+                        {renderKeywordCell(r.keywordCells, 2)}
+                        <td>{r.notes || <em className="muted">—</em>}</td>
+                        <td>
+                          {r.matchMode === "exact"
+                            ? "tam"
+                            : r.matchMode === "contains"
+                              ? "içerir"
+                              : <em className="muted">—</em>}
+                        </td>
+                      </tr>
+                    ),
+                  )}
+                </tbody>
+              </table>
+            )}
+          </div>
+        )}
+
         <div className="row" style={{ marginTop: 6 }}>
           <button onClick={handleBulkImport} disabled={!bulkText.trim()}>
             <Plus size={11} /> Ekle
@@ -188,8 +298,8 @@ export function OverrideEditor({ customers }: { customers: Customer[] }) {
                   className={`pill ${firmKnown ? "success" : "warn"}`}
                   title={
                     firmKnown
-                      ? "Firma müşteri listesinde bulundu"
-                      : "Firma müşteri listesinde yok — model yine de adı kullanabilir"
+                      ? "Firma müşteri listesinde bulundu — kural ücretlendirilebilir"
+                      : "Firma müşteri listesinde yok — kural modele gider ama chargeOnce throw eder (acntEuId boş)"
                   }
                 >
                   {firmKnown ? "✓ listede" : "⚠ listede yok"}
@@ -233,8 +343,14 @@ export function OverrideEditor({ customers }: { customers: Customer[] }) {
               {!firmKnown && o.accountName.trim() && (
                 <div className="override-row__warn">
                   <AlertCircle size={10} style={{ verticalAlign: "middle" }} />{" "}
-                  "{o.accountName}" müşteri listesinde yok. Model yine de bu ada
-                  sahip eşleşmeleri üretebilir, ama fiili ücretlendirme yapamaz.
+                  "<b>{o.accountName}</b>" müşteri listesinde yok. Bu kural
+                  <b> yine de modele gider</b> — AI, eşleşen keyword'leri
+                  bu adı kullanarak etiketler; fakat fiili ücretlendirme
+                  için <code>acntEuId</code> çözümlenemediğinden
+                  <b> <code>chargeOnce</code> throw eder</b> ve İncele
+                  ekranında bu satır <em>seçilemez</em>. Adı, listedeki bir
+                  firmayla birebir eşleşecek şekilde düzeltin (büyük-küçük
+                  harf ve boşluklar göz ardı edilir).
                 </div>
               )}
             </div>

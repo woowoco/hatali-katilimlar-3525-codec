@@ -90,7 +90,7 @@ describe("chargeOnce", () => {
       );
     }) as typeof fetch;
 
-    const res = await chargeOnce("sess-1", "firm-uuid", "Firm A", [11, 12, 13], "iptal");
+    const res = await chargeOnce("sess-1", "firm-uuid-0000-0000-0000-000000000001", "Firm A", [11, 12, 13], "iptal");
     expect(res.ok).toBe(true);
     expect(res.record.status).toBe("success");
     expect(res.record.transactionIds).toEqual([11, 12, 13]);
@@ -99,7 +99,7 @@ describe("chargeOnce", () => {
     // Wire shape mirrors the HAR: nested under requestValue.
     expect(sent.body).toMatchObject({
       requestValue: {
-        accountEuId: "firm-uuid",
+        accountEuId: "firm-uuid-0000-0000-0000-000000000001",
         transactionIdsWithSubscriptionDate: [11, 12, 13],
       },
     });
@@ -113,7 +113,7 @@ describe("chargeOnce", () => {
         body: { resultObject: false, isSuccess: false, resultCode: 42, resultDetails: "BUGÜN DEĞİL", exceptionInformation: null },
       },
     ]);
-    const res = await chargeOnce("sess-1", "firm-uuid", null, [99], "iptal");
+    const res = await chargeOnce("sess-1", "firm-uuid-0000-0000-0000-000000000001", null, [99], "iptal");
     expect(res.ok).toBe(false);
     expect(res.record.status).toBe("error");
     expect(res.record.resultCode).toBe(42);
@@ -124,7 +124,7 @@ describe("chargeOnce", () => {
     globalThis.fetch = vi.fn(async () => {
       throw new Error("network down");
     }) as typeof fetch;
-    const res = await chargeOnce("sess-1", "firm-uuid", null, [5], "iptal");
+    const res = await chargeOnce("sess-1", "firm-uuid-0000-0000-0000-000000000001", null, [5], "iptal");
     expect(res.ok).toBe(false);
     expect(res.record.status).toBe("error");
     expect(res.record.resultDetails).toMatch(/network down/);
@@ -151,7 +151,7 @@ describe("chargeOnce", () => {
 
     const res = await chargeOnce(
       "sess-1",
-      "firm-uuid",
+      "firm-uuid-0000-0000-0000-000000000001",
       null,
       [1, 1, 1, 2, 3, NaN as unknown as number],
       "iptal",
@@ -166,10 +166,68 @@ describe("chargeOnce", () => {
   it("refuses to call when no valid ids are provided", async () => {
     const fetchSpy = vi.fn();
     globalThis.fetch = fetchSpy as unknown as typeof fetch;
-    await expect(chargeOnce("sess-1", "firm-uuid", null, [])).rejects.toThrow(
+    await expect(chargeOnce("sess-1", "firm-uuid-0000-0000-0000-000000000001", null, [])).rejects.toThrow(
       /no transactionIds/,
     );
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ---------------------------------------------------------------------
+  // Regression: `accountEuId` "null" (the LLM emits the 4-char string)
+  // used to slip all the way to the network and the server rejected it
+  // with a GUID validation error. `chargeOnce` is the LAST guard before
+  // talking to the wire — it must refuse to POST a malformed value.
+  // ---------------------------------------------------------------------
+
+  it('refuses to POST when accountEuId is the literal string "null"', async () => {
+    const fetchSpy = vi.fn();
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+    await expect(
+      chargeOnce("sess-1", "null", "Firm A", [1]),
+    ).rejects.toThrow(/literal "null" string/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("refuses to POST when accountEuId is empty string", async () => {
+    const fetchSpy = vi.fn();
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+    await expect(
+      chargeOnce("sess-1", "", "Firm A", [1]),
+    ).rejects.toThrow(/boş string/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("refuses to POST when accountEuId is whitespace-only", async () => {
+    const fetchSpy = vi.fn();
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+    await expect(
+      chargeOnce("sess-1", "   ", "Firm A", [1]),
+    ).rejects.toThrow(/boş string/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("refuses to POST when accountEuId is shorter than a UUID", async () => {
+    // Anything below 32 chars can't be a UUID — refuse it so we don't
+    // round-trip a value the server can only reject with a GUID error.
+    const fetchSpy = vi.fn();
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+    await expect(
+      chargeOnce("sess-1", "short", "Firm A", [1]),
+    ).rejects.toThrow(/UUID kadar uzun değil/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("accepts a normal UUID-shaped accountEuId and POSTs it through", async () => {
+    installFetchMock([
+      {
+        pattern: CHARGED_URL,
+        status: 200,
+        body: { resultObject: true, isSuccess: true, resultCode: 0, resultDetails: "OK", exceptionInformation: null },
+      },
+    ]);
+    const ok = "00000000-0000-0000-0000-000000000000";
+    const res = await chargeOnce("sess-1", ok, "Codec", [1, 2]);
+    expect(res.ok).toBe(true);
   });
 
   it("appends an audit record for every call (success or error)", async () => {
@@ -180,7 +238,7 @@ describe("chargeOnce", () => {
         body: { resultObject: true, isSuccess: true, resultCode: 0, resultDetails: "OK", exceptionInformation: null },
       },
     ]);
-    await chargeOnce("sess-1", "firm-uuid", null, [1]);
+    await chargeOnce("sess-1", "firm-uuid-0000-0000-0000-000000000001", null, [1]);
     let log = await loadAudit();
     expect(log).toHaveLength(1);
     expect(log[0].transactionIds).toEqual([1]);
@@ -189,7 +247,7 @@ describe("chargeOnce", () => {
     globalThis.fetch = vi.fn(async () => {
       throw new Error("nope");
     }) as typeof fetch;
-    await chargeOnce("sess-1", "firm-uuid", null, [2]);
+    await chargeOnce("sess-1", "firm-uuid-0000-0000-0000-000000000001", null, [2]);
     log = await loadAudit();
     expect(log).toHaveLength(2);
     expect(log[1].status).toBe("error");

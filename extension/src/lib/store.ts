@@ -26,6 +26,18 @@ export async function saveSettings(settings: Settings): Promise<void> {
 
 // --- Session-scoped data ---------------------------------------------------
 
+/**
+ * Resolved firm identity for a txId or row. `accountEuId` is always a
+ * UUID-shaped string (validated by the helpers in `lib/ai.ts`); `accountName`
+ * is a display string only — the server keys by UUID. The `null` name
+ * case happens when a row resolves to the HAR-confirmed Codec fallback
+ * without a real customer behind it; UI substitutes "Codec".
+ */
+export type Firm = {
+  accountEuId: string;
+  accountName: string | null;
+};
+
 export interface SessionState {
   customers: Customer[];
   items: Item[];
@@ -34,8 +46,29 @@ export interface SessionState {
   fetchedAt: string | null;
   /** Set of transactionIds already charged successfully (greyed out in the UI). */
   chargedIds: number[];
-  /** Per-row firm overrides the operator has applied: keywordGroup → accountEuId + name. */
-  firmOverrides: Record<string, { accountEuId: string; accountName: string | null }>;
+  /**
+   * transactionIds the operator has explicitly removed from the table via
+   * the per-row ✕ button. Filtered out of `buildKeywordRows` like
+   * `chargedIds`, but never sent to the backend (no audit record). The
+   * operator can re-run `/categorize` to get fresh suggestions; ids in
+   * this list are still re-suggested by the AI if they appear in the
+   * source data again.
+   */
+  ignoredIds: number[];
+  /** Per-row firm overrides the operator has applied: keywordGroup → firm. */
+  firmOverrides: Record<string, Firm>;
+  /**
+   * Per-transactionId firm reassignment. Set by the operator from the
+   * per-row firm picker in the review table. Takes precedence over
+   * `firmOverrides` and the AI suggestion. Lets the operator move
+   * wrongly-suggested txIds to the correct firm without touching the
+   * rest of the row.
+   *
+   * Map shape: `{ [transactionId]: { accountEuId, accountName } }`. Empty
+   * object `{}` means "no per-tx reassignment yet"; each txId falls back
+   * to the row-level override or the AI suggestion.
+   */
+  txFirmOverrides: Record<number, Firm>;
   /** Last /categorize run's per-batch summaries; survives a re-open of /analyze. */
   lastBatches?: CategorizeBatchSummary[];
   /** Total items in the last categorize run; used for the batch table header. */
@@ -62,7 +95,9 @@ export const EMPTY_SESSION: SessionState = {
   model: null,
   fetchedAt: null,
   chargedIds: [],
+  ignoredIds: [],
   firmOverrides: {},
+  txFirmOverrides: {},
 };
 
 export async function loadSession(): Promise<SessionState> {

@@ -3,6 +3,7 @@ import type {
   Customer,
   UnmatchedItem,
 } from "../types.js";
+import { mockHandleRequest } from "./api-mock.js";
 
 const APP_ID = "9398192ec61d422a8331529989959242";
 const DEFAULT_BASE = "https://admin-panel-api.codec.com.tr";
@@ -36,12 +37,25 @@ interface FetchOpts {
   body?: unknown;
   /** When true, sets Content-Length: 0 and skips body — for endpoints with no payload. */
   emptyBody?: boolean;
+  /**
+   * Demo mode: route through api-mock.ts instead of fetch(). Wire shape
+   * is identical (real Response object, status, content-type, JSON body
+   * all match production) — only the network call is skipped. Defaults
+   * to false; the wrappers always pass it explicitly.
+   */
+  demoMode?: boolean;
 }
 
+/**
+ * Single pipeline for both real and demo-mode calls. Builds the same
+ * headers / body shape, then either issues a real `fetch()` or asks the
+ * in-process mock for a `Response`. The downstream `res.text()`,
+ * `res.ok`, `JSON.parse`, and error throwing run identically for both
+ * paths — that's the whole point of routing through here even in mock
+ * mode (so any wire-shape change here is reflected in mock responses
+ * too).
+ */
 async function call<TPath>(path: string, opts: FetchOpts): Promise<TPath> {
-  if (!opts.sessionId) {
-    throw new Error("sessionId boş — Ayarlar sekmesinden gir.");
-  }
   const headers: Record<string, string> = {
     accept: "application/json, text/plain, */*",
     appid: APP_ID,
@@ -58,11 +72,21 @@ async function call<TPath>(path: string, opts: FetchOpts): Promise<TPath> {
     headers["content-length"] = "0";
   }
 
-  const res = await fetch(`${BASE}${path}`, {
-    method: "POST",
-    headers,
-    body,
-  });
+  let res: Response;
+  if (opts.demoMode) {
+    // Mock ignores the auth headers but we still build them so the call
+    // site exercises the same header-construction code path.
+    res = await mockHandleRequest(path, { body: opts.body });
+  } else {
+    if (!opts.sessionId) {
+      throw new Error("sessionId boş — Ayarlar sekmesinden gir.");
+    }
+    res = await fetch(`${BASE}${path}`, {
+      method: "POST",
+      headers,
+      body,
+    });
+  }
 
   const text = await res.text();
   if (!res.ok) {
@@ -86,10 +110,11 @@ interface UnmatchedListResponse {
 
 export async function getCustomersToBeCharged(
   sessionId: string,
+  demoMode = false,
 ): Promise<Customer[]> {
   const r = await call<CustomerListResponse>(
     "/api/Menu3525/GetCustomersToBeCharged",
-    { sessionId, emptyBody: true },
+    { sessionId, emptyBody: true, demoMode },
   );
   return r.resultObject ?? [];
 }
@@ -101,6 +126,7 @@ export async function getUnmatchedList(
     keyword2?: string;
     msgContent?: string;
   },
+  demoMode = false,
 ): Promise<UnmatchedItem[]> {
   const r = await call<UnmatchedListResponse>(
     "/api/Menu3525/GetUnMatchedList",
@@ -114,6 +140,7 @@ export async function getUnmatchedList(
           useLikeSearch: 1,
         },
       },
+      demoMode,
     },
   );
   return r.resultObject ?? [];
@@ -130,6 +157,7 @@ export async function charged(
   sessionId: string,
   accountEuId: string,
   transactionIds: number[],
+  demoMode = false,
 ): Promise<ChargedResponse> {
   return call<ChargedResponse>("/api/Menu3525/Charged", {
     sessionId,
@@ -139,6 +167,7 @@ export async function charged(
         transactionIdsWithSubscriptionDate: transactionIds,
       },
     },
+    demoMode,
   });
 }
 

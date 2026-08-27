@@ -6,6 +6,7 @@ type Status = "checking" | "ok" | "error";
 
 interface Props {
   proxyUrl: string;
+  demoMode?: boolean;
 }
 
 /**
@@ -14,7 +15,7 @@ interface Props {
  * Three states render with green/red/muted styling — the same `.pill`
  * tokens already defined in styles.css.
  */
-export function ProxyStatus({ proxyUrl }: Props) {
+export function ProxyStatus({ proxyUrl, demoMode = false }: Props) {
   const [status, setStatus] = useState<Status>("checking");
   const [reason, setReason] = useState<string>("");
   // Avoid running the first probe twice in StrictMode dev.
@@ -23,7 +24,7 @@ export function ProxyStatus({ proxyUrl }: Props) {
   const probe = async () => {
     setStatus("checking");
     try {
-      const res = await fetchModels(proxyUrl);
+      const res = await fetchModels(proxyUrl, demoMode);
       if (res?.models?.length > 0) {
         setStatus("ok");
         setReason("");

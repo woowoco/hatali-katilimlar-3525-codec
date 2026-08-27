@@ -187,6 +187,27 @@ export function createApp(fixtures: MockFixture): { app: Express; state: MockSta
     });
   });
 
+  // Demo seeder — manual UI verification only. Returns plain JSON so
+  // the operator's one-liner doesn't need eval() (Chrome MV3 CSP blocks
+  // 'unsafe-eval'). The popup console pipeline:
+  //   fetch(url).then(r=>r.json()).then(d=>chrome.storage.local.set(d))
+  // avoids both eval and inline-script restrictions.
+  app.get("/__mock/demo-seed.json", (_req, res) => {
+    const seedPath = join(
+      dirname(fileURLToPath(import.meta.url)),
+      "..",
+      "..",
+      "tests",
+      "demo-seed.json",
+    );
+    try {
+      const body = readFileSync(seedPath, "utf-8");
+      res.type("application/json").send(body);
+    } catch (err) {
+      res.status(500).json({ error: `demo-seed not found at ${seedPath}: ${String(err)}` });
+    }
+  });
+
   return { app, state };
 }
 

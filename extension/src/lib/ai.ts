@@ -7,14 +7,25 @@ import type {
   ModelInfo,
   UnmatchedItem,
 } from "../types.js";
-import type { ItemSubset } from "./store.js";
+import { CODEC_ACCOUNT_EU_ID } from "../types.js";
+import type { Firm, ItemSubset } from "./store.js";
+import { DEMO_CATEGORIZE_RESPONSE } from "./api-mock.js";
 
 interface ModelsResponse {
   default: string;
   models: ModelInfo[];
 }
 
-export async function fetchModels(proxyUrl: string): Promise<ModelsResponse> {
+const DEMO_MODELS_RESPONSE: ModelsResponse = {
+  default: "demo-mock",
+  models: [{ id: "demo-mock", label: "Demo Mock", recommended: true }],
+};
+
+export async function fetchModels(
+  proxyUrl: string,
+  demoMode = false,
+): Promise<ModelsResponse> {
+  if (demoMode) return DEMO_MODELS_RESPONSE;
   const res = await fetch(`${proxyUrl}/models`);
   if (!res.ok) throw new Error(`proxy /models ${res.status}`);
   return res.json();
@@ -60,8 +71,39 @@ export async function categorize(
   customers: Customer[],
   overrides: KeywordOverride[] = [],
   onProgress?: (info: CategorizeProgressInfo) => void,
-  opts: { stallTimeoutMs?: number; signal?: AbortSignal } = {},
+  opts: { stallTimeoutMs?: number; signal?: AbortSignal; demoMode?: boolean } = {},
 ): Promise<CategorizeResponse> {
+  // Demo mode short-circuits the SSE stream — emits one batch-done then
+  // a done event so the live progress UI still ticks. No network round-trip.
+  if (opts.demoMode) {
+    onProgress?.({
+      batchIndex: 0,
+      batchesTotal: 1,
+      accumulatedMatches: 0,
+      currentBatchSize: items.length,
+      batchSummaries: {},
+      finishedBatches: [],
+      timedOutBatches: [],
+      currentTimeoutMs: 90_000,
+      consecutiveTimeouts: 0,
+    });
+    await sleep(50);
+    onProgress?.({
+      batchIndex: 0,
+      batchesTotal: 1,
+      accumulatedMatches: DEMO_CATEGORIZE_RESPONSE.matches.length,
+      currentBatchSize: items.length,
+      batchSummaries: {
+        0: { i: 0, size: items.length, matches: DEMO_CATEGORIZE_RESPONSE.matches.length, accumulated: DEMO_CATEGORIZE_RESPONSE.matches.length },
+      },
+      finishedBatches: [0],
+      timedOutBatches: [],
+      currentTimeoutMs: 90_000,
+      consecutiveTimeouts: 0,
+    });
+    return DEMO_CATEGORIZE_RESPONSE;
+  }
+
   // 3 minutes default — long enough for a 100-item batch under load
   // (worst observed: ~95s with 8 workers), but short enough that a
   // truly stuck proxy surfaces an error instead of hanging forever.
@@ -304,7 +346,16 @@ export interface BuildKeywordRowsOptions {
     string,
     { accountEuId: string; accountName: string | null }
   >;
+  /**
+   * transactionIds the operator explicitly removed from the table via the
+   * per-row ✕ button. Treated like `chargedIds`: filtered out before
+   * bucketing, never written to a row, drop a row to empty when every
+   * match is in this set.
+   */
+  ignoredIds?: ReadonlySet<number>;
 }
+
+const EMPTY_SET: ReadonlySet<number> = new Set<number>();
 
 /**
  * Bucket AI matches into rows. Rows with suggestedAccountEuId === null are
@@ -312,19 +363,30 @@ export interface BuildKeywordRowsOptions {
  * operator under "Codec'e ücretlendir".
  *
  * Rows whose every match is already charged are dropped — the operator
- * doesn't need to act on them. Already-charged txIds inside a still-active
- * row are filtered out before bucketing.
+ * doesn't need to act on them. Already-charged txIds and operator-removed
+ * (ignored) txIds are filtered out before bucketing; both lists reduce the
+ * row's match count identically so the same `if (ms.length === 0) continue`
+ * rule applies for either cause.
  */
 export function buildKeywordRows(
   matches: ItemMatch[],
   chargedIds: ReadonlySet<number>,
   opts: BuildKeywordRowsOptions = {},
 ): KeywordRow[] {
+  const ignoredIds = opts.ignoredIds ?? EMPTY_SET;
   const byGroup = new Map<string, ItemMatch[]>();
   let codecRow: ItemMatch[] = [];
 
   for (const m of matches) {
+    // Partial-result guard: when an upstream batch fails (timeout, 5xx,
+    // malformed tool_use input) the preallocated slot in `allMatches`
+    // stays `undefined`, which JSON-stringifies as `null` in the
+    // CategorizeResponse. We never get a chance to retry those
+    // transactions here — the operator must click "Tekrar dene" on the
+    // Analyze step. Skip the slot so the rest of the table stays usable.
+    if (m == null) continue;
     if (chargedIds.has(m.transactionId)) continue; // greyed out — already charged
+    if (ignoredIds.has(m.transactionId)) continue; // operator removed it from the table
     if (m.suggestedAccountEuId === null) {
       codecRow.push(m);
       continue;
@@ -422,6 +484,70 @@ function makeRow(
 }
 
 /**
+ * Normalize an `accountEuId`-shaped value coming from the AI / persisted
+ * session. Treats JS `null`/`undefined`, the literal STRING `"null"`, and
+ * empty strings as "no firm" — returns `null` in those cases.
+ *
+ * Why this lives here: the AI tool schema and earlier `validateMatches`
+ * already coerce JS null to `null`, but the LLM sometimes emits the
+ * 4-character JSON STRING `"null"` instead (the tool schema's
+ * `type: "string"` allowed it; the description just said "or null"). That
+ * string survived `m.suggestedAccountEuId ?? null`, went through
+ * `buildKeywordRows` (which uses strict `=== null` for the Codec bucket),
+ * and ended up as the `row.suggestedAccountEuId` for a normal keyword row.
+ * `resolveFirm` then handed it straight to `chargeOnce` and the POST body
+ * was `"accountEuId": "null"` — which the server rejected with a GUID
+ * validation error. This sanitizer is the chokepoint that makes
+ * `resolveFirm` immune to that mis-shape.
+ */
+export function sanitizeAccountEuId(v: unknown): string | null {
+  if (v == null) return null;
+  if (typeof v !== "string") return null;
+  const trimmed = v.trim();
+  if (trimmed === "" || trimmed === "null") return null;
+  return trimmed;
+}
+
+/**
+ * Resolve the firm (accountEuId + accountName) that `chargeOnce` will use
+ * for a given row. Pure helper — extracted from StepReview.tsx so the
+ * codec-fallback semantics can be regression-tested.
+ *
+ * CRITICAL: the `__codec_fallback__` group ALWAYS returns the HAR-confirmed
+ * UUID `00000000-0000-0000-0000-000000000000`. The admin-panel-api rejects
+ * any other `accountEuId` for these rows with a GUID validation error, so
+ * a stray override (or a stale `suggestedAccountEuId`) would silently send
+ * `null` / a wrong UUID and break the POST. The override entry for a Codec
+ * row is dropped at the source by `setRowFirm` (in StepReview), but this
+ * function is the defense-in-depth that guarantees the UUID regardless.
+ *
+ * For non-Codec rows the AI's `suggestedAccountEuId` is run through
+ * `sanitizeAccountEuId` so a literal string `"null"` (or any other
+ * mis-shape) does NOT become the `accountEuId` we end up POSTing.
+ */
+export function resolveFirm(
+  row: KeywordRow,
+  firmOverrides: Record<
+    string,
+    { accountEuId: string; accountName: string | null }
+  > | undefined,
+): { accountEuId: string; accountName: string | null } {
+  if (row.group === "__codec_fallback__") {
+    return { accountEuId: CODEC_ACCOUNT_EU_ID, accountName: "Codec" };
+  }
+  const override = firmOverrides?.[row.group];
+  if (override) {
+    const sanitized = sanitizeAccountEuId(override.accountEuId);
+    if (sanitized) return { accountEuId: sanitized, accountName: override.accountName };
+  }
+  const sanitized = sanitizeAccountEuId(row.suggestedAccountEuId);
+  return {
+    accountEuId: sanitized ?? CODEC_ACCOUNT_EU_ID,
+    accountName: row.suggestedAccountName ?? "Codec",
+  };
+}
+
+/**
  * Group operator-selected txIds by their keyword row so the action bar's
  * "Ücretlendir" button can dispatch ONE POST per row with only the
  * selected ids. Pure helper — extracted from StepReview.tsx so we can
@@ -471,4 +597,256 @@ export function flattenSelection(
     for (const txId of sorted) out.push({ row, txId });
   }
   return out;
+}
+
+// --- Per-txId firm resolution + flat firm-table grouping ------------------
+//
+// Below this banner: helpers for the firm-flat view in StepReview.tsx,
+// where one table per firm holds every txId routed to that firm (across
+// all AI keyword rows), and the operator can manually reassign any
+// single txId to a different firm. The cross-firm contamination guard
+// (defense layer #1 — see `docs/SAFETY-CONTRACT.md`) lives here.
+
+export interface FirmSectionItem {
+  transactionId: number;
+  row: KeywordRow;
+  match: ItemMatch;
+  effectiveFirm: Firm;
+  /**
+   * Which layer of the precedence chain won for this item. Used by the
+   * UI to apply a "tx-override" badge so the operator can see WHICH
+   * txIds they've personally reassigned (vs. row-level overrides
+   * inherited from the dropdown, vs. AI suggestions).
+   */
+  source: "tx-override" | "row-override" | "suggested" | "codec-fallback";
+}
+
+export interface FirmSection {
+  /** Unique grouping key — equals `accountEuId` for every section. */
+  firmKey: string;
+  accountEuId: string;
+  accountName: string | null;
+  items: FirmSectionItem[];
+  /** How many of `items` are in the operator's flat selection set. */
+  selectedCount: number;
+}
+
+/**
+ * Resolve the firm for a single txId RIGHT NOW, given the full state the
+ * caller already has. Precedence (highest first):
+ *   1. `txFirmOverrides[txId]`         — operator-set per-tx reassignment
+ *   2. `firmOverrides[row.group]`       — operator-set per-row override
+ *   3. `row.suggestedAccountEuId`       — AI suggestion (sanitized)
+ *   4. `CODEC_ACCOUNT_EU_ID`            — safety-net Codec fallback
+ *
+ * This helper is the single source of truth for "what firm does this
+ * txId belong to at this exact moment?". The charge handler MUST call
+ * this for every txId in the POST — see `chargeFirm` in StepReview.tsx.
+ * Caching the result across renders is forbidden; the whole point of
+ * precedence layer #1 is that the operator can flip a single txId and
+ * see the next render charge it under the new firm.
+ */
+export function resolveFirmForTx(
+  txId: number,
+  row: KeywordRow,
+  firmOverrides: Record<string, Firm> | undefined,
+  txFirmOverrides: Record<number, Firm> | undefined,
+): Firm {
+  const txOv = txFirmOverrides?.[txId];
+  if (txOv) {
+    const s = sanitizeAccountEuId(txOv.accountEuId);
+    if (s) return { accountEuId: s, accountName: txOv.accountName };
+  }
+  // delegate to the existing helper so all the previously-tested sanitization
+  // paths (string "null", null suggestion, override sanitization) still apply.
+  return resolveFirm(row, firmOverrides);
+}
+
+/**
+ * Walk the AI's keyword rows, resolve every txId to its CURRENT firm,
+ * and bucket them into one section per firm. The output is a flat
+ * table — one section per firm, no nested grouping by keyword.
+ *
+ * Pure helper — re-runs cheaply on every render. `rows` is assumed to
+ * already be the `buildKeywordRows` output (charged + ignored filtered);
+ * this function does not re-filter.
+ *
+ * Section order:
+ *   1. Real firms first (by name, Turkish locale-aware).
+ *   2. The Codec fallback section last if present.
+ *
+ * Within each section, items are sorted by `transactionId` ascending so
+ * the operator can scan the table top-to-bottom without re-sorting.
+ */
+export function groupByFirm(
+  rows: readonly KeywordRow[],
+  firmOverrides: Record<string, Firm> | undefined,
+  txFirmOverrides: Record<number, Firm> | undefined,
+  selected: ReadonlySet<number>,
+): FirmSection[] {
+  const byFirm = new Map<
+    string,
+    { accountName: string | null; items: FirmSectionItem[]; selectedCount: number }
+  >();
+  const tr = (s: string) => s.toLocaleLowerCase("tr-TR");
+
+  for (const row of rows) {
+    for (const match of row.matches) {
+      const txId = match.transactionId;
+      const firm = resolveFirmForTx(txId, row, firmOverrides, txFirmOverrides);
+      const key = firm.accountEuId;
+      const source: FirmSectionItem["source"] =
+        txFirmOverrides?.[txId]?.accountEuId === firm.accountEuId
+          ? "tx-override"
+          : firmOverrides?.[row.group]?.accountEuId === firm.accountEuId
+            ? "row-override"
+            : row.group === "__codec_fallback__"
+              ? "codec-fallback"
+              : "suggested";
+
+      let section = byFirm.get(key);
+      if (!section) {
+        section = { accountName: firm.accountName, items: [], selectedCount: 0 };
+        byFirm.set(key, section);
+      }
+      // If multiple sources disagree on the name for the same UUID, keep
+      // the first we saw — names are display-only and the server keys
+      // by UUID, so this is purely cosmetic.
+      if (section.accountName == null && firm.accountName != null) {
+        section.accountName = firm.accountName;
+      }
+      section.items.push({
+        transactionId: txId,
+        row,
+        match,
+        effectiveFirm: firm,
+        source,
+      });
+      if (selected.has(txId)) section.selectedCount += 1;
+    }
+  }
+
+  // Sort each section's items by txId ascending — stable, easy to scan.
+  for (const section of byFirm.values()) {
+    section.items.sort((a, b) => a.transactionId - b.transactionId);
+  }
+
+  // Sort sections: real firms first (by name), Codec fallback last.
+  const sections: FirmSection[] = [];
+  const codecSections: FirmSection[] = [];
+  for (const [firmKey, sec] of byFirm) {
+    const out: FirmSection = {
+      firmKey,
+      accountEuId: firmKey,
+      accountName: sec.accountName ?? "Codec",
+      items: sec.items,
+      selectedCount: sec.selectedCount,
+    };
+    if (firmKey === CODEC_ACCOUNT_EU_ID) codecSections.push(out);
+    else sections.push(out);
+  }
+  sections.sort((a, b) => tr(a.accountName ?? "").localeCompare(tr(b.accountName ?? "")));
+  return [...sections, ...codecSections];
+}
+
+/**
+ * Walk every firm section, return the txIds the operator has selected
+ * grouped by section. Used by the charge handler so each section's
+ * "Ücretlendir" button can pull only the ids that still belong to that
+ * section under the current `txFirmOverrides` map.
+ *
+ * If a txId was selected under section A and then reassigned to section
+ * B, this function surfaces it under section B (not A) — so the stale
+ * A-side selection becomes a no-op rather than mixing firms.
+ */
+export function flattenSelected(
+  sections: readonly FirmSection[],
+  selected: ReadonlySet<number>,
+): { firmKey: string; accountEuId: string; accountName: string | null; txIds: number[] }[] {
+  const out: {
+    firmKey: string;
+    accountEuId: string;
+    accountName: string | null;
+    txIds: number[];
+  }[] = [];
+  for (const section of sections) {
+    if (section.selectedCount === 0) continue;
+    const txIds: number[] = [];
+    for (const item of section.items) {
+      if (selected.has(item.transactionId)) txIds.push(item.transactionId);
+    }
+    if (txIds.length === 0) continue;
+    out.push({
+      firmKey: section.firmKey,
+      accountEuId: section.accountEuId,
+      accountName: section.accountName,
+      txIds,
+    });
+  }
+  return out;
+}
+
+// --- Bulk-copy formats -----------------------------------------------------
+
+/**
+ * txId listesi için kullanıcının clipboard'a kopyalamak istediği format
+ * tipleri. Eski "Seçili (N) Ücretlendir" butonunun yanına eklenen
+ * dropdown / buton grubu bu enum'dan beslenir.
+ *
+ * - `sql`: SQL `IN (...)` için tek-tırnaklı liste → `('1001','1002',...)`.
+ *   Backend `WHERE transactionId IN (...)` sorgularına yapıştırmak için.
+ * - `csv`: Virgülle ayrılmış düz liste → `1001,1002,1003`. Excel'e
+ *   yapıştırınca tek satır, hücreler ayrı.
+ * - `lines`: Satır başına tek txId → `1001\n1002\n1003`. Excel'e yapıştırınca
+ *   dikey sütun; ayrıca Slack/Teams mesajı olarak okunaklı.
+ * - `json`: JSON dizisi → `["1001","1002",...]`. Script'lere geçmek için.
+ */
+export type BulkCopyFormat = "sql" | "csv" | "lines" | "json";
+
+export const BULK_COPY_FORMATS: readonly BulkCopyFormat[] = [
+  "sql",
+  "csv",
+  "lines",
+  "json",
+];
+
+/** Display label for the copy-format buttons. */
+export function bulkCopyLabel(format: BulkCopyFormat): string {
+  switch (format) {
+    case "sql":
+      return "SQL";
+    case "csv":
+      return "CSV";
+    case "lines":
+      return "Satır";
+    case "json":
+      return "JSON";
+  }
+}
+
+/**
+ * Seçili txId listesini istenen formata çevir. Pure helper; UI çağırır,
+ * çıktıyı `navigator.clipboard.writeText` ile panoya yazar.
+ *
+ * Hiçbir seçim yoksa null döner — caller toast ile uyarır.
+ */
+export function formatTxIdsForCopy(
+  ids: readonly number[],
+  format: BulkCopyFormat,
+): string | null {
+  if (ids.length === 0) return null;
+  // Stable order: küçükten büyüğe sırala. chargeOnce zaten POST'a
+  // gönderirken sırayı backend'e bırakır ama clipboard'a kopyalanan
+  // metnin deterministik olması operatör için önemli (diff/paste).
+  const sorted = [...ids].sort((a, b) => a - b);
+  switch (format) {
+    case "sql":
+      return `('${sorted.join("','")}')`;
+    case "csv":
+      return sorted.join(",");
+    case "lines":
+      return sorted.join("\n");
+    case "json":
+      return JSON.stringify(sorted.map(String));
+  }
 }

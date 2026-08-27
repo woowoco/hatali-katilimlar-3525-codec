@@ -104,7 +104,7 @@ export function Sidebar({ reachable, settings, version }: Props) {
         </ul>
 
         <div className="app-sidebar__footer">
-          <ProxyStatus proxyUrl={settings.proxyUrl} />
+          <ProxyStatus proxyUrl={settings.proxyUrl} demoMode={settings.demoMode} />
           <div className="app-sidebar__version">v{version}</div>
         </div>
       </div>

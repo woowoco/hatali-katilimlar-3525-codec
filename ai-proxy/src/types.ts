@@ -60,6 +60,8 @@ export interface KeywordOverride {
   /** Resolved against the customer list before sending; may be null. */
   acntEuId: string | null;
   keywords: string[];
+  /** Optional operator note explaining the rule — surfaced verbatim in the AI prompt. */
+  notes?: string;
   /** Defaults to "contains" if omitted. */
   matchMode?: OverrideMatchMode;
 }

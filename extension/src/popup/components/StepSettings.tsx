@@ -1,24 +1,34 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useOutletContext } from "react-router-dom";
 import {
+  FlaskConical,
   FileSearch,
   KeyRound,
+  ListChecks,
   RefreshCw,
   Save,
   Trash2,
 } from "lucide-react";
 import { fetchModels } from "../../lib/ai.js";
+import { DEMO_FIXTURE } from "../../lib/api-mock.js";
 import { extractSessionFromHar } from "../../lib/har.js";
 import { discoverSession } from "../../lib/session.js";
-import { clearAudit, loadAudit, loadSession, saveSettings } from "../../lib/store.js";
+import {
+  clearAudit,
+  clearSession,
+  EMPTY_SESSION,
+  loadAudit,
+  saveSession,
+  saveSettings,
+  type SessionState,
+} from "../../lib/store.js";
 import type { ModelInfo } from "../../types.js";
 import type { RouteCtx } from "../App.js";
 import { useToast } from "./Toast.js";
-import { OverrideEditor } from "./OverrideEditor.js";
 
 export function StepSettings() {
   const ctx = useOutletContext<RouteCtx>();
-  const { settings, setSettings } = ctx;
+  const { settings, setSettings, session, setSession } = ctx;
   const navigate = useNavigate();
   const toast = useToast();
 
@@ -26,7 +36,6 @@ export function StepSettings() {
   const [proxyOk, setProxyOk] = useState<boolean | null>(null);
   const [auditCount, setAuditCount] = useState<number>(0);
   const [busy, setBusy] = useState(false);
-  const [customers, setCustomers] = useState<{ name: string; acntEuId: string }[]>([]);
   const [discoverStatus, setDiscoverStatus] = useState<{
     state: "idle" | "running" | "ok" | "fail";
     message?: string;
@@ -35,13 +44,12 @@ export function StepSettings() {
 
   useEffect(() => {
     loadAudit().then((a) => setAuditCount(a.length));
-    loadSession().then((s) => setCustomers(s.customers));
   }, []);
 
   const refreshModels = async () => {
     setBusy(true);
     try {
-      const r = await fetchModels(settings.proxyUrl);
+      const r = await fetchModels(settings.proxyUrl, settings.demoMode);
       setModels(r.models);
       setProxyOk(true);
       if (!settings.model) {
@@ -145,6 +153,98 @@ export function StepSettings() {
     setAuditCount(0);
     toast.push("Audit log temizlendi", "info");
   };
+
+  /**
+   * Pre-populate `chrome.storage.local` with the 24-item multi-firm demo
+   * fixture so the operator lands directly on /review with the firm-flat
+   * layout visible (12 + 6 + 6 = 24 txIds across 3 firm sections). No
+   * backend or proxy required when Settings.demoMode is also on.
+   */
+  const handleLoadDemoData = async () => {
+    const next: SessionState = {
+      customers: DEMO_FIXTURE.customers,
+      items: DEMO_FIXTURE.items,
+      matches: DEMO_FIXTURE.matches,
+      model: "demo-mock",
+      fetchedAt: new Date().toISOString(),
+      chargedIds: [],
+      ignoredIds: [],
+      firmOverrides: {},
+      txFirmOverrides: {},
+    };
+    await saveSession(next);
+    setSession(next);
+    if (!settings.demoMode) {
+      const next = { ...settings, demoMode: true };
+      setSettings(next);
+      try { await saveSettings(next); }
+      catch { /* non-fatal: in-memory toggle still works for this session */ }
+    }
+    toast.push(
+      "Demo verisi yüklendi — İncele sekmesine geçebilirsin.",
+      "success",
+    );
+    navigate("/review");
+  };
+
+  /**
+   * Wipe the in-memory and persisted session so the UI reverts to the
+   * empty pre-fetch state. Use case: operator finished experimenting
+   * with the demo fixture and wants a clean slate before connecting to
+   * a real backend, OR wants to re-load the demo with a fresh
+   * generated timestamp without restarting the popup.
+   *
+   * What's removed:
+   *   - customers / items / matches (the actual fetched/synthesized data)
+   *   - chargedIds / ignoredIds / firmOverrides / txFirmOverrides (per-row UI state)
+   *   - lastBatches / lastItemsCount / subset / model / fetchedAt (analyze metadata)
+   *   - chrome.storage.local `session.v1` (handled by clearSession)
+   *
+   * What survives:
+   *   - settings (proxyUrl, model selection, throttleMs, demoMode flag)
+   *   - audit log (history of Charged POSTs actually sent)
+   *   - keyword override rules (`overrides.v1`, not session-scoped)
+   *
+   * settings.demoMode is intentionally NOT turned off — flipping it
+   * back on for the next "Demo verisini yükle" should be one click.
+   * The toggle's text already says "(mock veri)" so it's not silently
+   * dangerous: StepFetch / StepAnalyze clearly route through the mock.
+   */
+  const handleClearDemoData = async () => {
+    const hasData =
+      session.items.length > 0 ||
+      session.matches !== null ||
+      session.customers.length > 0;
+    if (!hasData) return;
+    const ok = confirm(
+      "Demo verisi (müşteri listesi, kayıtlar, AI eşleşmeleri, ücretlendirme ve override'lar) silinecek.\n\n" +
+        "Ayarların, audit log ve kalıcı keyword kuralların korunacak.\n\n" +
+        "Devam edilsin mi?",
+    );
+    if (!ok) return;
+    try {
+      await clearSession();
+      setSession(EMPTY_SESSION);
+      toast.push("Demo verisi silindi — tüm UI sıfırlandı.", "info");
+      // Force-navigate to /settings so any stale /review state (cached
+      // memo'd firmSections, selection Set<number>, etc.) is unmounted.
+      // The reachable Set computed in App.tsx already reflects the empty
+      // session, but navigating is belt-and-suspenders.
+      navigate("/settings");
+    } catch (err) {
+      toast.push(
+        `Silme başarısız: ${err instanceof Error ? err.message : String(err)}`,
+        "error",
+      );
+    }
+  };
+
+  // True when any demo data is currently resident in the session —
+  // used to decide whether the "Demo verisini sil" button is meaningful.
+  const demoDataLoaded =
+    session.items.length > 0 ||
+    session.matches !== null ||
+    session.customers.length > 0;
 
   return (
     <div className="section">
@@ -282,7 +382,93 @@ export function StepSettings() {
           borderTop: "1px solid var(--border)",
         }}
       >
-        <OverrideEditor customers={customers} />
+        <label
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            fontWeight: 500,
+            margin: 0,
+          }}
+        >
+          <ListChecks size={12} /> Özel Yönlendirme Kuralları
+        </label>
+        <p className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+          Kurallar artık <b>Verileri Çek</b> sekmesinde — müşteri listesi
+          çekildikten sonra firma adları doğrudan eşleşir ve AI
+          tarafından otomatik tespit edilemeyen keyword'ler için hızlı
+          kural ekleme paneli görünür.
+        </p>
+        <div className="row" style={{ marginTop: 8 }}>
+          <button
+            disabled={session.items.length === 0 && session.customers.length === 0}
+            onClick={() => navigate("/fetch")}
+            title={
+              session.items.length === 0 && session.customers.length === 0
+                ? "Önce Verileri Çek sekmesinden veri çek"
+                : "Verileri Çek sekmesine git"
+            }
+          >
+            <ListChecks size={12} /> Kuralları yönet →
+          </button>
+        </div>
+      </div>
+
+      <div
+        style={{
+          marginTop: 16,
+          paddingTop: 12,
+          borderTop: "1px solid var(--border)",
+        }}
+      >
+        <label
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            cursor: "pointer",
+            fontWeight: 500,
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={settings.demoMode}
+            onChange={async (e) => {
+              const next = { ...settings, demoMode: e.target.checked };
+              setSettings(next);
+              // Persist immediately — the operator expects the toggle to
+              // survive a popup reload (otherwise they forget they turned
+              // it on and StepFetch / StepAnalyze will hit the live API).
+              try { await saveSettings(next); }
+              catch (err) {
+                toast.push(
+                  `Demo modu kaydedilemedi: ${err instanceof Error ? err.message : String(err)}`,
+                  "error",
+                );
+              }
+            }}
+          />
+          <FlaskConical size={12} /> Demo modu (mock veri)
+        </label>
+        <p className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+          Admin-panel-api ve AI proxy çağrıları extension'ın içindeki fixture
+          ile cevaplanır — gerçek backend'e <b>hiçbir istek gitmez</b>. Sadece
+          arayüz doğrulaması içindir; production'da kapalı kalmalı.
+        </p>
+        <div className="row" style={{ marginTop: 8 }}>
+          <button onClick={handleLoadDemoData}>
+            <FlaskConical size={12} /> Demo verisini yükle
+          </button>
+          {demoDataLoaded && (
+            <button
+              className="danger"
+              onClick={handleClearDemoData}
+              title="Demo verisini sil — tüm UI sıfırlanır, settings + audit log + override kuralları korunur"
+            >
+              <Trash2 size={12} /> Demo verisini sil
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );

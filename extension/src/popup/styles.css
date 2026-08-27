@@ -671,9 +671,111 @@ label:first-child {
   padding: 5px 12px;
 }
 
+/* --- Bulk reassign row ----------------------------------------------- */
+/* Appears only when at least one txId is selected. Sticky inside the
+ * toolbar so it stays visible while scrolling long firm-section lists.
+ * Visual cue: tinted background to differentiate from neutral filter
+ * rows above. The "Yönlendir" button is `primary` (accent color) to
+ * signal it's the call-to-action; "Temizle" stays `ghost` to avoid
+ * accidental selection wipes. */
+.review-toolbar .toolbar-bulk {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+  border-radius: var(--radius);
+  padding: 6px 10px;
+}
+
+.review-toolbar .toolbar-bulk__count {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-2);
+}
+
+.review-toolbar .toolbar-bulk__count strong {
+  color: var(--accent);
+  font-size: 12px;
+}
+
+.review-toolbar .toolbar-bulk__firm {
+  flex: 1;
+  min-width: 160px;
+  max-width: 320px;
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg-1);
+  color: var(--text-0);
+}
+
 /* ==========================================================================
    Review flat table
    ========================================================================== */
+
+/* --- Skeleton loading state ----------------------------------------- */
+/* StepReview mounts with potentially large `matches` array; computing
+ * keyword rows + firm sections synchronously can block the main thread
+ * for 100–800ms on a 700-item run, freezing the popup. We trade that
+ * freeze for a brief skeleton: 5–7 placeholder rows with shimmer
+ * animation, plus a "Veriler hazırlanıyor…" hint. The skeleton replaces
+ * only the table body — header / summary / search box render normally
+ * so the operator retains context during the deferred computation. */
+@keyframes review-skeleton-shimmer {
+  0% { background-position: -240px 0; }
+  100% { background-position: 240px 0; }
+}
+
+.review-skeleton {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: var(--bg-1);
+}
+
+.review-skeleton__bar {
+  height: 12px;
+  margin: 8px 14px;
+  border-radius: 4px;
+  background: linear-gradient(
+    90deg,
+    var(--bg-2) 0%,
+    var(--bg-3, #2a2d33) 50%,
+    var(--bg-2) 100%
+  );
+  background-size: 240px 100%;
+  animation: review-skeleton-shimmer 1.4s linear infinite;
+}
+
+.review-skeleton__bar--title { width: 32%; height: 14px; margin: 12px 14px 4px; }
+.review-skeleton__bar--row   { width: 78%; }
+.review-skeleton__bar--row.is-short { width: 48%; }
+.review-skeleton__bar--row.is-mid   { width: 64%; }
+
+.review-skeleton__hint {
+  padding: 8px 14px 12px;
+  font-size: 11px;
+  color: var(--text-2);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.review-skeleton__hint .spin {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  animation: review-skeleton-shimmer-rotate 0.9s linear infinite;
+}
+
+@keyframes review-skeleton-shimmer-rotate {
+  to { transform: rotate(360deg); }
+}
 
 .review-table {
   display: flex;
@@ -684,41 +786,7 @@ label:first-child {
   background: var(--bg-1);
 }
 
-.review-table__head,
-.review-row__head {
-  display: grid;
-  grid-template-columns:
-    36px        /* checkbox */
-    minmax(0, 1fr) /* label */
-    minmax(180px, 220px) /* firm */
-    56px        /* count */
-    80px        /* conf */
-    minmax(180px, 200px); /* actions */
-  align-items: center;
-  gap: 10px;
-  padding: 10px 14px;
-  font-size: 12px;
-}
-
-.review-table__head {
-  background: var(--bg-2);
-  border-bottom: 1px solid var(--border);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  font-size: 10.5px;
-  font-weight: 600;
-  color: var(--text-2);
-  position: sticky;
-  /* `--toolbar-h` is set by StepReview via ResizeObserver; 110px is
-     a safe fallback that fits the current toolbar contents. */
-  top: var(--toolbar-h, 110px);
-  z-index: 4;
-}
-
-/* --- Firm-grouped section header (visual grouping, no merging) -------
-   Renders one banner per effective firm above its keyword rows. Lets the
-   operator see that e.g. "iptal", "odeme", "bilgi" all route to Aktif
-   Bank without losing the per-keyword granularity. */
+/* --- Firm section head (re-used) ------------------------------------- */
 .review-firm-section__head {
   display: flex;
   align-items: center;
@@ -730,66 +798,6 @@ label:first-child {
   letter-spacing: 0.04em;
   background: var(--bg-2);
   border-top: 2px solid var(--border);
-}
-.review-row + .review-firm-section__head {
-  /* When rows visually precede the next firm's header, keep a small gap
-     from the previous row's border via the section's own border-top. */
-}
-.review-row__head:has(+ .review-firm-section__head) {
-  /* No-op rule reserved for future tweaks. */
-}
-
-.review-row {
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-1);
-  transition: background 0.1s;
-}
-.review-row:last-child { border-bottom: none; }
-.review-row:hover { background: var(--bg-2); }
-.review-row.codec { border-left: 3px solid var(--warning); }
-.review-row.high { border-left: 3px solid var(--success); }
-.review-row.medium { border-left: 3px solid var(--warning); }
-.review-row.low { border-left: 3px solid var(--danger); }
-.review-row.overridden { background: rgba(91, 140, 255, 0.04); }
-.review-row.expanded { background: var(--bg-2); }
-
-.review-row__head {
-  padding: 8px 14px;
-  cursor: pointer;
-  user-select: none;
-}
-
-.review-row .col {
-  display: flex;
-  align-items: center;
-  min-width: 0;
-}
-
-.review-row .col-check {
-  justify-content: center;
-  cursor: pointer;
-}
-
-.review-row .col-label {
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 4px;
-}
-
-.row-label {
-  font-weight: 600;
-  font-size: 13px;
-  color: var(--text-0);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 100%;
-}
-
-.row-meta {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
 }
 
 .pill.sm {
@@ -811,83 +819,157 @@ label:first-child {
   border: 1px solid var(--warning);
 }
 
-.col-firm select {
-  width: 100%;
-  font-size: 11.5px;
-  padding: 4px 6px;
-}
-
-.col-count {
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  justify-content: center;
-  color: var(--text-0);
-}
-
-.col-conf .pill { font-size: 10px; padding: 2px 8px; }
 .pill.high { background: rgba(45, 212, 168, 0.12); color: var(--success); border: 1px solid var(--success); }
 .pill.medium { background: rgba(245, 185, 78, 0.12); color: var(--warning); border: 1px solid var(--warning); }
 .pill.low { background: rgba(255, 107, 107, 0.12); color: var(--danger); border: 1px solid var(--danger); }
 
-.col-actions {
-  justify-content: flex-end;
-  gap: 6px;
-  flex-wrap: nowrap;
-}
+/* ==========================================================================
+   Firma-düzeyi tablo (Phase B refactor)
 
-.col-actions button {
-  font-size: 11px;
-  padding: 4px 10px;
-}
+   Bir section = tek firma. İçinde tüm txId'ler (farklı keyword row'larından
+   gelen) tek tabloda. Per-tx reassign dropdown'ı her satırda. Footer'da
+   "Seçili (N) Ücretlendir" — global ActionBar kaldırıldı (cross-firm
+   bulaşma riski yüzünden).
+   ========================================================================== */
 
-.col-actions button.sm {
-  font-size: 11px;
-  padding: 4px 10px;
-}
-
-/* --- expanded txId list ----------------------------------------------- */
-
-.txid-list {
-  background: var(--bg-0);
-  border-top: 1px solid var(--border);
-  padding: 6px 14px 10px 14px;
+.review-firm-section {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  max-height: 360px;
-  overflow-y: auto;
+  border-bottom: 1px solid var(--border);
+}
+.review-firm-section:last-child {
+  border-bottom: none;
+}
+.review-firm-section.codec .review-firm-section__head {
+  border-top-color: var(--warning);
 }
 
-.txid-row {
-  display: grid;
-  grid-template-columns:
-    24px            /* checkbox */
-    minmax(90px, 110px) /* tx id */
-    70px            /* field */
-    minmax(0, 1fr)  /* value */
-    minmax(110px, 140px) /* phone */
-    28px            /* copy */
-    28px            /* inline charge */
-    18px;           /* status */
-  align-items: center;
-  gap: 8px;
-  padding: 4px 6px;
-  border-radius: var(--radius);
-  font-size: 11.5px;
+.review-tx-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  table-layout: auto;
+}
+
+.review-tx-table thead th {
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-2);
+  padding: 8px 10px;
+  text-align: left;
+  /* Sticky olmadığı için scroll'da header kayar — toolbar zaten sticky,
+     bu tablonun başlıkları için kabul edilebilir (eski implementasyon da
+     aynı tradeoff'u yapıyordu). */
+}
+
+.review-tx-table tbody td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
   color: var(--text-1);
-  transition: background 0.1s;
 }
-.txid-row:hover { background: var(--bg-2); }
-.txid-row.selected {
-  background: var(--accent-soft);
-  outline: 1px solid var(--accent);
-}
-.txid-row.cp-running { background: rgba(91, 140, 255, 0.08); }
-.txid-row.cp-ok { opacity: 0.6; }
-.txid-row.cp-fail { background: rgba(255, 107, 107, 0.08); }
 
-.txid-row__check {
-  display: flex;
+.review-tx-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.review-tx-table tbody tr:hover td {
+  background: var(--bg-2);
+}
+
+.review-tx-table tr.selected td {
+  background: var(--accent-soft);
+}
+.review-tx-table tr.selected:hover td {
+  background: rgba(91, 140, 255, 0.18);
+}
+
+/* tx-override — operatörün bu txId için manuel reassign yaptığı satır.
+   AI önerisi geçersiz sayıldı; dikkat çeksin. */
+.review-tx-table tr.tx-overridden td {
+  background: rgba(91, 140, 255, 0.06);
+  box-shadow: inset 3px 0 0 0 var(--accent);
+}
+.review-tx-table tr.tx-overridden:hover td {
+  background: rgba(91, 140, 255, 0.12);
+}
+
+/* Confidence sol-bordürü — AI güven seviyesini görsel ipucu olarak
+   göstermek için. */
+.review-tx-table tr.cp-high td:first-child   { border-left: 3px solid var(--success); }
+.review-tx-table tr.cp-medium td:first-child { border-left: 3px solid var(--warning); }
+.review-tx-table tr.cp-low td:first-child    { border-left: 3px solid var(--danger); }
+
+/* Hücreler */
+.review-tx-table .tx-check {
+  width: 32px;
+  text-align: center;
+}
+.review-tx-table .tx-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.review-tx-table .tx-kw {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--text-1);
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.review-tx-table .tx-msg {
+  font-style: italic;
+  color: var(--text-2);
+  font-size: 11px;
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.review-tx-table .tx-conf {
+  width: 80px;
+}
+.review-tx-table .tx-conf .pill {
+  font-size: 9.5px;
+  padding: 1px 8px;
+}
+.review-tx-table .tx-firm-picker {
+  width: 200px;
+  min-width: 160px;
+}
+.review-tx-table .tx-firm-picker select {
+  width: 100%;
+  font-size: 11.5px;
+  padding: 4px 6px;
+}
+/* tx-override seçili dropdown — accent border + soft background. */
+.review-tx-table .tx-firm-picker select.tx-override {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+.review-tx-table .tx-actions {
+  width: 70px;
+  text-align: right;
+}
+.review-tx-table .tx-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px 6px;
+  font-size: 10.5px;
+}
+
+.tx-row__check {
+  display: inline-flex;
   align-items: center;
   justify-content: center;
   background: transparent;
@@ -896,200 +978,39 @@ label:first-child {
   cursor: pointer;
   color: var(--text-2);
 }
-.txid-row__check:hover { color: var(--accent); }
+.tx-row__check:hover { color: var(--accent); }
 
-.txid-row__id {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  color: var(--accent);
-  font-size: 11.5px;
-}
-
-.txid-row__field {
-  font-size: 10px;
-  color: var(--text-2);
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-}
-
-.txid-row__kw {
-  color: var(--text-1);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
-}
-
-.txid-row__phone {
-  color: var(--text-2);
-  font-size: 11px;
-}
-
-.txid-row__copy {
+/* Footer — section'ın altındaki seçili-txId Ücretlendir butonu.
+   `align-items` center yaparak sol metin + sağ buton yan yana. */
+.review-firm-section__footer {
   display: flex;
   align-items: center;
-  justify-content: center;
-  background: transparent;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 3px;
-  cursor: pointer;
-  color: var(--text-2);
-}
-.txid-row__copy:hover {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-
-/* Inline per-txId "Ücretlendir" button — single-tx POST trigger.
-   Same size as copy button so the row stays compact, but warning-tinted
-   to distinguish "this sends a request" from the inert copy action. */
-.txid-row__charge {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: transparent;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 3px;
-  cursor: pointer;
-  color: var(--warning);
-}
-.txid-row__charge:hover:not(:disabled) {
-  border-color: var(--warning);
-  background: rgba(245, 185, 78, 0.08);
-}
-
-.txid-row__status {
-  font-size: 12px;
-  font-weight: 700;
-  text-align: center;
-}
-.txid-row__status.cp-ok { color: var(--success); }
-.txid-row__status.cp-fail { color: var(--danger); }
-.txid-row__status.cp-running { color: var(--accent); }
-
-.txid-list__more {
-  font-size: 11px;
-  padding: 6px 4px 0 4px;
-  color: var(--text-2);
-}
-
-/* ==========================================================================
-   Sticky action bar (selection-driven)
-   ========================================================================== */
-
-.action-bar {
-  position: sticky;
-  bottom: 0;
-  left: 0;
-  right: 0;
-  margin: 16px -8px -8px -8px;
-  background: var(--bg-2);
-  border: 1px solid var(--accent);
-  border-radius: var(--radius-lg);
-  padding: 10px 14px;
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  flex-wrap: wrap;
-  box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.5);
-  z-index: 6;
-}
-
-.action-bar__count {
-  font-size: 12.5px;
-  color: var(--text-1);
-}
-.action-bar__count strong {
-  color: var(--accent);
-  font-variant-numeric: tabular-nums;
-  font-size: 14px;
-}
-
-.action-bar__group {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-left: auto;
-}
-.action-bar__group:first-of-type {
-  margin-left: 0;
-}
-.action-bar__group label {
-  font-size: 11px;
-  color: var(--text-2);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-.action-bar__group select {
-  font-size: 11.5px;
-  padding: 3px 6px;
-  min-width: 0;
-}
-.action-bar__group button {
-  font-size: 11.5px;
-  padding: 5px 12px;
-}
-
-@media (max-width: 720px) {
-  .review-table__head { display: none; }
-  .review-row__head,
-  .review-table__head {
-    grid-template-columns: 32px 1fr 60px;
-    gap: 8px;
-  }
-  .review-row__head .col-firm,
-  .review-row__head .col-conf,
-  .review-row__head .col-actions { display: none; }
-  .review-row__head.expanded { grid-template-columns: 32px 1fr 60px; }
-  .txid-row { grid-template-columns: 22px 1fr 28px 28px 18px; gap: 6px; }
-  .txid-row__field,
-  .txid-row__phone { display: none; }
-  .action-bar { flex-direction: column; align-items: stretch; gap: 8px; }
-  .action-bar__group { margin-left: 0; width: 100%; justify-content: space-between; }
-}
-
-/* ==========================================================================
-   Charge progress strip
-   ========================================================================== */
-
-.charge-progress {
-  background: var(--bg-0);
-  border-top: 1px solid var(--border);
-  padding: 8px 14px 10px 14px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.charge-progress__head {
-  display: flex;
   justify-content: space-between;
-  align-items: center;
-  font-size: 11.5px;
-  color: var(--text-2);
-  font-variant-numeric: tabular-nums;
+  gap: 12px;
+  padding: 10px 14px;
+  border-top: 1px dashed var(--border);
+  background: var(--bg-2);
 }
 
-.charge-progress__head svg.spin {
-  vertical-align: middle;
-  margin-right: 4px;
-  animation: spin 1s linear infinite;
+.review-firm-section__footer button[disabled] {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
-.charge-progress__bar {
-  height: 4px;
-  background: var(--bg-3);
-  border-radius: 999px;
-  overflow: hidden;
-}
-
-.charge-progress__bar span {
-  display: block;
-  height: 100%;
-  background: linear-gradient(90deg, var(--accent), var(--success));
-  transition: width 0.2s;
+/* ==========================================================================
+   Responsive — küçük ekranda firma section'lar dikey stack olarak kalır,
+   ama tablo genişliği taşarsa yatay scroll alır.
+   ========================================================================== */
+@media (max-width: 720px) {
+  .review-tx-table {
+    display: block;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+  .review-tx-table .tx-msg,
+  .review-tx-table .tx-kw {
+    max-width: 120px;
+  }
 }
 
 /* ==========================================================================
@@ -1784,6 +1705,106 @@ label:first-child {
   font-size: 11px;
 }
 
+/* Excel-style preview table for bulk paste. Mirrors what the operator
+ * pasted row-by-row with a status badge so they can confirm before
+ * clicking "Ekle". Hidden when the textarea is empty. */
+.override-preview {
+  margin-top: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-2);
+  overflow-x: auto;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.override-preview__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-1);
+}
+
+.override-preview__counts {
+  display: inline-flex;
+  gap: 8px;
+  font-size: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.override-preview__counts .ok { color: var(--success, #2dd4a8); }
+.override-preview__counts .warn { color: #f0c674; }
+.override-preview__counts .err  { color: var(--danger, #ff6b6b); }
+
+.override-preview__table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.override-preview__table th,
+.override-preview__table td {
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  white-space: nowrap;
+  vertical-align: top;
+}
+
+.override-preview__table th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-1);
+  color: var(--text-2);
+  font-weight: 600;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.override-preview__row--ok {
+  background: rgba(45, 212, 168, 0.05);
+}
+.override-preview__row--firm-unknown {
+  background: rgba(240, 198, 116, 0.07);
+}
+.override-preview__row--no-firm,
+.override-preview__row--no-keywords,
+.override-preview__row--error {
+  background: rgba(255, 107, 107, 0.06);
+}
+.override-preview__row--header {
+  background: var(--bg-1);
+  font-style: italic;
+}
+
+.override-preview__row:nth-child(even) td {
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.override-preview__badge {
+  display: inline-block;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 600;
+}
+.override-preview__badge--ok {
+  background: rgba(45, 212, 168, 0.18);
+  color: var(--success, #2dd4a8);
+}
+.override-preview__badge--warn {
+  background: rgba(240, 198, 116, 0.18);
+  color: #f0c674;
+}
+.override-preview__badge--err {
+  background: rgba(255, 107, 107, 0.18);
+  color: var(--danger, #ff6b6b);
+}
+
 .override-editor__rows {
   display: flex;
   flex-direction: column;
@@ -1883,81 +1904,6 @@ label:first-child {
 }
 
 /* ==========================================================================
-   Per-item charge progress checklist (StepReview)
-   ========================================================================== */
-
-.charge-progress {
-  margin-top: 10px;
-  padding: 12px;
-  background: var(--bg-1);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-}
-
-.charge-progress__head {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 8px;
-  font-size: 12px;
-}
-
-.charge-progress__head .title {
-  font-weight: 600;
-  color: var(--text-0);
-}
-
-.charge-progress__head .counter {
-  color: var(--text-2);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-
-.charge-progress__bar {
-  height: 6px;
-  border-radius: 999px;
-  background: var(--bg-2);
-  overflow: hidden;
-  margin-bottom: 8px;
-}
-
-.charge-progress__bar > span {
-  display: block;
-  height: 100%;
-  background: var(--accent);
-  transition: width 220ms ease;
-}
-
-.charge-progress__items {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-  gap: 4px 12px;
-  max-height: 180px;
-  overflow-y: auto;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11.5px;
-}
-
-.charge-progress__item {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 2px 0;
-  color: var(--text-2);
-}
-
-.charge-progress__item--ok    { color: var(--success); }
-.charge-progress__item--fail  { color: var(--danger); }
-.charge-progress__item--pending { color: var(--text-2); opacity: 0.7; }
-
-.charge-progress__item svg {
-  flex-shrink: 0;
-}
-
-.charge-progress__item .id {
-  color: var(--text-1);
-}
-
-/* ==========================================================================
    Audit log toolbar — export buttons
    ========================================================================== */
 
@@ -2047,3 +1993,131 @@ label:first-child {
     max-height: 140px;
   }
 }
+
+/* ---------- StepFetch quick-add keyword panel ---------- */
+.section-sub {
+  border-top: 1px solid var(--border);
+  margin-top: 14px;
+  padding-top: 12px;
+}
+
+.section-sub h3 {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-1);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.unique-keywords {
+  list-style: none;
+  padding: 0;
+  margin: 6px 0 0;
+  font-size: 11px;
+}
+
+.unique-keywords li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px dashed var(--border);
+}
+
+.unique-keywords li:last-child {
+  border-bottom: 0;
+}
+
+.unique-keywords .kw {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--accent);
+  flex: 1;
+  word-break: break-all;
+}
+
+.unique-keywords .cnt {
+  color: var(--text-2);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.unique-keywords input[type="text"] {
+  flex: 0 0 auto;
+  padding: 3px 6px;
+  font-size: 11px;
+  background: var(--bg-2);
+  color: var(--text-1);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.unique-keywords__row--editing {
+  background: rgba(94, 234, 212, 0.05);
+  border-radius: 4px;
+  padding-left: 6px;
+  padding-right: 6px;
+}
+
+/* ---------- StepReview inline firm override editor ---------- */
+.firm-override-mini {
+  margin: 6px 0 10px;
+  padding: 8px 10px;
+  background: var(--bg-1);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+}
+
+.firm-override-mini__head {
+  margin-bottom: 4px;
+}
+
+.firm-override-mini__list {
+  list-style: none;
+  padding: 0;
+  margin: 4px 0 6px;
+  font-size: 11px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.firm-override-mini__list li {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+.firm-override-mini__kw {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--accent);
+}
+
+.firm-override-mini__mode {
+  font-size: 9px;
+  color: var(--text-2);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.firm-override-mini__add {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.firm-override-mini__add input[type="text"] {
+  flex: 1;
+  padding: 3px 6px;
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--bg-2);
+  color: var(--text-1);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+

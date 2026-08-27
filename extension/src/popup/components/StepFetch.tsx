@@ -5,12 +5,10 @@ import {
   getCustomersToBeCharged,
   getUnmatchedList,
 } from "../../lib/api.js";
-import {
-  EMPTY_SESSION,
-  saveSession,
-  type SessionState,
-} from "../../lib/store.js";
+import { EMPTY_SESSION, saveSession, type SessionState } from "../../lib/store.js";
+import type { Customer } from "../../types.js";
 import type { RouteCtx } from "../App.js";
+import { OverrideEditor } from "./OverrideEditor.js";
 import { useToast } from "./Toast.js";
 
 export function StepFetch() {
@@ -38,11 +36,18 @@ export function StepFetch() {
     setCustomersProgress("running");
 
     try {
-      const customers = await getCustomersToBeCharged(settings.sessionId);
+      const customers = await getCustomersToBeCharged(
+        settings.sessionId,
+        settings.demoMode,
+      );
       setSession({ ...session, customers });
       setCustomersProgress("done");
 
-      const items = await getUnmatchedList(settings.sessionId);
+      const items = await getUnmatchedList(
+        settings.sessionId,
+        undefined,
+        settings.demoMode,
+      );
 
       const next: SessionState = {
         ...EMPTY_SESSION,
@@ -124,6 +129,26 @@ export function StepFetch() {
           <button onClick={reset} disabled={busy}>
             Sıfırla
           </button>
+        </div>
+      )}
+
+      {session.customers.length > 0 && (
+        <div
+          style={{
+            marginTop: 16,
+            paddingTop: 12,
+            borderTop: "1px solid var(--border)",
+          }}
+        >
+          <h3 style={{ marginTop: 0, marginBottom: 4 }}>
+            Özel Yönlendirme Kuralları
+          </h3>
+          <p className="muted" style={{ fontSize: 11, marginTop: 0 }}>
+            Model bu kurallara <em>her zaman</em> uyar. Müşteri listesi
+            çekildiği için firma adları artık doğrudan eşleşir
+            (aşağıdaki datalist'ten seçim yapabilirsin).
+          </p>
+          <OverrideEditor customers={session.customers as Customer[]} />
         </div>
       )}
     </div>

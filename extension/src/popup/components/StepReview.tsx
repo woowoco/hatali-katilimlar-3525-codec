@@ -1,9 +1,6 @@
-import { useLayoutEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useOutletContext } from "react-router-dom";
 import {
-  ChevronDown,
-  ChevronUp,
-  Zap,
   AlertTriangle,
   ListChecks,
   Square,
@@ -12,70 +9,86 @@ import {
   Copy,
   X,
   Search,
+  MessageSquare,
+  Zap,
+  ArrowRight,
 } from "lucide-react";
 import {
   buildKeywordRows,
-  flattenSelection,
-  groupSelectionByRow,
+  BULK_COPY_FORMATS,
+  bulkCopyLabel,
+  formatTxIdsForCopy,
+  groupByFirm,
+  resolveFirmForTx,
+  type BulkCopyFormat,
   type KeywordRow,
 } from "../../lib/ai.js";
 import { chargeOnce } from "../../lib/charger.js";
-import { saveSession, type SessionState } from "../../lib/store.js";
+import { saveSession, type Firm, type SessionState } from "../../lib/store.js";
 import type { Customer, UnmatchedItem } from "../../types.js";
+import { CODEC_ACCOUNT_EU_ID, CODEC_ACCOUNT_NAME } from "../../types.js";
 import type { RouteCtx } from "../App.js";
+import { FirmOverrideMini } from "./FirmOverrideMini.js";
 import { useToast } from "./Toast.js";
 
 type RowFilter = "all" | "high" | "medium" | "low" | "codec";
-type CopyFormat = "comma" | "json" | "newline" | "sql";
 
-interface ItemProgress {
-  id: number;
-  state: "pending" | "running" | "ok" | "fail";
-  error?: string;
-}
+// Stable empty Set used in place of `chargedSet` when calling
+// `buildKeywordRows`. We deliberately want buildKeywordRows to keep ALL
+// matches (including just-charged ones) in the underlying rows, and
+// filter charged items at the `visibleRows` layer instead. Why:
+//
+//   1. The heavy stage-1 effect that runs buildKeywordRows must stay
+//      stable when `session.chargedIds` changes — otherwise a single
+//      successful charge would re-run the deferred 2-RAF pipeline and
+//      flash the skeleton.
+//   2. buildKeywordRows already drops charged txIds entirely; if we
+//      passed the real `chargedSet`, rows would shrink on every charge
+//      and downstream caches would invalidate.
+//   3. visibleRows already runs on every render, so adding a charged
+//      filter there is free (it's a single Set.has lookup per row).
+const EMPTY_CHARGED: ReadonlySet<number> = new Set<number>();
 
 /**
- * Format the given txIds according to the user's chosen format.
- * - comma  → "123, 456, 789"
- * - json   → "[123, 456, 789]"
- * - newline→ "123\n456\n789"
- * - sql    → "(123, 456, 789)"
+ * İncele & Ücretlendir ekranı.
+ *
+ * MİMARİ (bkz. `docs/SAFETY-CONTRACT.md` ve plan §B–§D):
+ * - AI keyword row'ları `KeywordRow` olarak gelir (`buildKeywordRows`).
+ * - Her txId `resolveFirmForTx` ile GEÇERLİK ANINDAKİ firmasına çözülür.
+ * - `groupByFirm` bunları firma-bazlı düz tablolara dizer; her section =
+ *   tek firma, içinde tüm txId'leri (farklı keyword row'larından gelen).
+ * - Selection DÜZ `Set<number>` — rowKey değil txId tutarız, böylece
+ *   reassign sonrası bile txId kaybolmaz.
+ * - `chargeFirm` section başına tetiklenir, charge anında HER txId'i
+ *   yeniden çözer; Set<accountEuId>.size > 1 ise POST'a hiç geçmez
+ *   (cross-firm bulaşma savunması — `chargeOnce`'daki UUID guard ile
+ *   birlikte 2. katman).
  */
-function formatTxIds(ids: number[], format: CopyFormat): string {
-  switch (format) {
-    case "comma": return ids.join(", ");
-    case "newline": return ids.join("\n");
-    case "json": return JSON.stringify(ids);
-    case "sql": return `(${ids.join(", ")})`;
-  }
-}
-
-const COPY_FORMAT_LABEL: Record<CopyFormat, string> = {
-  comma: "Virgülle (123, 456)",
-  newline: "Satır başına",
-  json: "JSON dizi",
-  sql: "SQL IN (123, 456)",
-};
-
 export function StepReview() {
   const ctx = useOutletContext<RouteCtx>();
   const { settings, session, setSession } = ctx;
   const toast = useToast();
 
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const [busyRow, setBusyRow] = useState<string | null>(null);
+  // Cross-firm bulaşma riski: global ActionBar'ı KALDIRDIK. Her section'ın
+  // kendi footer'ında "Seçili (N) Ücretlendir" butonu var; UI yalnızca
+  // section.accountEuId'ye yönlendirir.
+  const [busyFirm, setBusyFirm] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<RowFilter>("all");
-  const [chargeProgress, setChargeProgress] = useState<Map<string, ItemProgress> | null>(null);
 
-  // Per-row txId selection — keyed by `rowGroup:txId` so each row has its own set.
-  const [selected, setSelected] = useState<Map<string, Set<number>>>(new Map());
+  // Düz seçim — Set<number>. reassign sonrası bile txId kaybolmaz,
+  // sadece section'ı değişir (groupByFirm yeni section'a dizer).
+  const [selected, setSelected] = useState<Set<number>>(new Set());
 
-  // Copy bar state
-  const [copyFormat, setCopyFormat] = useState<CopyFormat>("comma");
-
-  // Search box — filters rows whose label matches, or whose any txId matches.
+  // Filtre toolbar'ı
   const [search, setSearch] = useState("");
+
+  // Tablo hücrelerinde msgContent kolonu göster/gizle (popup-scoped).
+  const [showMsgContent, setShowMsgContent] = useState(true);
+
+  // Bulk reassign için hedef firma seçimi. "" = henüz seçilmedi. Apply
+  // butonu bu değer boşken disabled. Selection temizlenince reset edilir.
+  const [bulkFirmChoice, setBulkFirmChoice] = useState<string>("");
 
   const itemsById = useMemo(() => {
     const m = new Map<number, UnmatchedItem>();
@@ -88,38 +101,126 @@ export function StepReview() {
     [session.chargedIds],
   );
 
-  const rows = useMemo(
-    () =>
-      buildKeywordRows(session.matches ?? [], chargedSet, {
-        firmOverrides: session.firmOverrides,
-      }),
-    [session.matches, chargedSet, session.firmOverrides],
+  const ignoredSet = useMemo(
+    () => new Set(session.ignoredIds ?? []),
+    [session.ignoredIds],
   );
 
   /**
-   * Sticky-offset probe: the table header sits at `top: var(--toolbar-h)`
-   * and we measure the toolbar's rendered height with a ResizeObserver so
-   * the offset stays correct across viewport widths and locale changes
-   * (the search box / filter buttons have no fixed height).
+   * Render pipeline.
+   *
+   * Why this is two-stage (not a single `useMemo`):
+   * -----------------------------------------------
+   * A 700-item run needs ~50ms of `buildKeywordRows` + ~50ms of
+   * `groupByFirm` + ~300–600ms of DOM mount (per-row `<select>` ×
+   * customer `<option>`). Doing all of that in one render freezes the
+   * popup for the whole block. Splitting it across one paint keeps the
+   * skeleton visible during the heavy compute, and lets React commit
+   * the DOM-mount step after the user has visual confirmation that
+   * something is happening.
+   *
+   * Each effect owns its OWN cancel handle. Earlier we tried sharing a
+   * `cancelRafRef` across three effects, but Effect B's RAF-for-
+   * groupByFirm would cancel Effect C's reveal-tick RAFs (or vice
+   * versa), which manifested as "data doesn't load on entry" / "flash
+   * on every checkbox click". Local cancellation per effect is simpler
+   * and removes that race.
+   *
+   * Stage 1 (heavy):  defer `buildKeywordRows` over 2 RAFs so the
+   *                  skeleton has a frame to paint first.
+   * Stage 2 (light): `groupByFirm` runs as a `useMemo` — ~50ms is
+   *                  fast enough to be synchronous and avoids the
+   *                  stage race entirely.
+   *
+   * No progressive reveal: we render all sections at once when ready.
+   * The remaining freeze is the DOM mount cost. Reducing that would
+   * need virtualization, which is out of scope.
+   *
+   * Threshold: ≤30 matches runs synchronously (one frame, no flash).
    */
-  useLayoutEffect(() => {
-    if (typeof ResizeObserver === "undefined") return;
-    const tb = document.querySelector(".review-toolbar");
-    const root = document.documentElement;
-    if (!tb || !root) return;
-    const update = () => {
-      const h = tb.getBoundingClientRect().height;
-      root.style.setProperty("--toolbar-h", `${Math.round(h) + 8}px`);
-    };
-    update();
-    const ro = new ResizeObserver(update);
-    ro.observe(tb);
-    window.addEventListener("resize", update);
+  type RenderPhase = "skeleton" | "ready";
+  const matches = session.matches ?? [];
+  const matchesLen = matches.length;
+  const isHeavy = matchesLen > 30;
+
+  const [phase, setPhase] = useState<RenderPhase>(
+    matchesLen === 0 || !isHeavy ? "ready" : "skeleton",
+  );
+  const [rows, setRows] = useState<KeywordRow[]>([]);
+
+  // --- Stage 1: buildKeywordRows, deferred -----------------------------
+  // Owns its own cancel handle — no sharing with stage 2. Cleanups
+  // cancel the in-flight RAF chain for this effect only.
+  //
+  // CRITICAL: `chargedSet` is INTENTIONALLY not a dep. Charging txIds
+  // updates `session.chargedIds` → new Set ref → if we listed it here
+  // the effect would re-run, the skeleton would flash, and the table
+  // would re-mount on every successful charge. We filter charged txIds
+  // at the `visibleRows` layer instead (see below), so this stage stays
+  // stable across charges.
+  useEffect(() => {
+    let cancelled = false;
+    let innerRafId = 0;
+    let outerRafId = 0;
+
+    if (matchesLen === 0) {
+      setRows([]);
+      setPhase("ready");
+      return () => {
+        cancelled = true;
+        cancelAnimationFrame(innerRafId);
+        cancelAnimationFrame(outerRafId);
+      };
+    }
+
+    // Pass a STABLE EMPTY set to buildKeywordRows — charged filtering
+    // happens downstream at visibleRows level. See comment above.
+    const emptyCharged: ReadonlySet<number> = EMPTY_CHARGED;
+
+    // Light path: synchronous. No skeleton flash, no RAF cost.
+    if (!isHeavy) {
+      const r = buildKeywordRows(matches, emptyCharged, {
+        firmOverrides: session.firmOverrides,
+        ignoredIds: ignoredSet,
+      });
+      if (cancelled) return () => {
+        cancelled = true;
+        cancelAnimationFrame(innerRafId);
+        cancelAnimationFrame(outerRafId);
+      };
+      setRows(r);
+      setPhase("ready");
+      return () => {
+        cancelled = true;
+        cancelAnimationFrame(innerRafId);
+        cancelAnimationFrame(outerRafId);
+      };
+    }
+
+    // Heavy path: skeleton → ready across 2 RAFs.
+    setRows([]);
+    setPhase("skeleton");
+
+    outerRafId = requestAnimationFrame(() => {
+      if (cancelled) return;
+      innerRafId = requestAnimationFrame(() => {
+        if (cancelled) return;
+        const r = buildKeywordRows(matches, emptyCharged, {
+          firmOverrides: session.firmOverrides,
+          ignoredIds: ignoredSet,
+        });
+        if (cancelled) return;
+        setRows(r);
+        setPhase("ready");
+      });
+    });
+
     return () => {
-      ro.disconnect();
-      window.removeEventListener("resize", update);
+      cancelled = true;
+      cancelAnimationFrame(outerRafId);
+      cancelAnimationFrame(innerRafId);
     };
-  }, []);
+  }, [matches, session.firmOverrides, ignoredSet, matchesLen, isHeavy]);
 
   const customersById = useMemo(() => {
     const m = new Map<string, Customer>();
@@ -127,18 +228,51 @@ export function StepReview() {
     return m;
   }, [session.customers]);
 
+  /**
+   * visibleRows is a pure derivation from `rows` + filter + search +
+   * chargedSet. It runs synchronously and is cheap (≤O(N) filter pass
+   * on already-grouped KeywordRow objects), so it stays a `useMemo`.
+   *
+   * Charged-txId filtering happens HERE, not in `buildKeywordRows`.
+   * Reasoning: charging updates `session.chargedIds` every time, which
+   * would re-trigger the heavy stage-1 effect if it were a dep. Keeping
+   * the filter at this layer means the table re-derives "without these
+   * N rows" instantly on each charge, with no skeleton flash.
+   */
   const visibleRows = useMemo(() => {
+    if (phase === "skeleton") return [];
     let r = rows;
-    if (filter === "codec") r = r.filter((x) => x.group === "__codec_fallback__");
-    else if (filter !== "all")
-      r = r.filter((x) => x.worstConfidence === filter && x.group !== "__codec_fallback__");
+
+    // Drop fully-charged rows: if every ItemMatch in a KeywordRow has
+    // already been charged, the whole row is empty — no point showing
+    // it. We keep partially-charged rows and let the per-row renderer
+    // skip the already-charged cells.
+    if (chargedSet.size > 0) {
+      r = r
+        .map((row) => {
+          const remaining = row.matches.filter(
+            (m) => !chargedSet.has(m.transactionId),
+          );
+          return remaining.length === row.matches.length
+            ? row
+            : { ...row, matches: remaining };
+        })
+        .filter((row) => row.matches.length > 0);
+    }
+
+    if (filter === "codec") {
+      r = r.filter((x) => x.group === "__codec_fallback__");
+    } else if (filter !== "all") {
+      r = r.filter(
+        (x) => x.worstConfidence === filter && x.group !== "__codec_fallback__",
+      );
+    }
 
     const q = search.trim().toLowerCase();
     if (q) {
       r = r.filter((x) => {
         if (x.label.toLowerCase().includes(q)) return true;
         if (x.group.toLowerCase().includes(q)) return true;
-        // match by txId substring
         if (q.startsWith("#") || /^\d+$/.test(q)) {
           const needle = q.replace(/^#/, "");
           return x.matches.some((m) => String(m.transactionId).includes(needle));
@@ -147,141 +281,368 @@ export function StepReview() {
       });
     }
     return r;
-  }, [rows, filter, search]);
+  }, [rows, filter, search, phase, chargedSet]);
+
+  // --- Stage 2: groupByFirm as a useMemo ----------------------------------
+  // Synchronous. ~50ms for 700 rows is fast enough to take as a single
+  // hit, and it eliminates the Effect-B-vs-Effect-C race we hit when
+  // groupByFirm itself was deferred. Selection/filter/reassign all
+  // funnel through here and produce a stable result for the renderer.
+  const firmSections = useMemo(() => {
+    if (phase !== "ready") return [];
+    return groupByFirm(
+      visibleRows,
+      session.firmOverrides,
+      session.txFirmOverrides,
+      selected,
+    );
+  }, [visibleRows, session.firmOverrides, session.txFirmOverrides, selected, phase]);
+
+  // --- Seçim yardımcıları -------------------------------------------------
 
   /**
-   * Group visibleRows by their effective firm so the operator can see at a
-   * glance which keyword clusters route to the same firm (e.g. multiple
-   * keywords all pointing at Aktif Bank). Each group is rendered as its
-   * own <section> — rows inside are still independently chargeable.
-   *
-   * Pure visual grouping: a per-row firm override still affects only that
-   * row (same behavior as before). The grouping key is the row's
-   * `firmGroupKey`, which already factors in overrides.
+   * Shift+click range selection için son plain-click txId'sini tutar.
+   * Anchor shift+click'lerde SABİT kalır — operatör zincirleme range
+   * seçebilir (A → shift+B → shift+C). Sadece plain click (modifier'sız)
+   * anchor'ı hareket ettirir.
    */
-  const firmGroupedRows = useMemo(() => {
-    const groups = new Map<
-      string,
-      { firmName: string; firmKey: string; rows: KeywordRow[] }
-    >();
-    for (const row of visibleRows) {
-      const firm = resolveFirm(row);
-      const key = row.firmGroupKey || row.group;
-      const label = firm.accountName ?? "Bilinmeyen firma";
-      const existing = groups.get(key);
-      if (existing) {
-        existing.rows.push(row);
-      } else {
-        groups.set(key, { firmName: label, firmKey: key, rows: [row] });
+  const [anchor, setAnchor] = useState<number | null>(null);
+
+  /**
+   * Range selection için global sıra haritası: ekranda görünen tüm
+   * txId'ler section sırasına göre düzleştirilmiş bir listede. Section
+   * sınırlarını aşan range'ler (A bir section'ta, B başka section'ta)
+   * doğru çalışsın diye bu map gerekli.
+   *
+   * firmSections değiştikçe yeniden hesaplanır (yeni filtre / bulk
+   * reassign sonrası). Charged/reassign edilmiş txId'ler bu listeye
+   * girmez — sadece ekranda görünen txId'ler.
+   */
+  const txIdIndex = useMemo(() => {
+    const toIndex = new Map<number, number>();
+    const toTxId = new Map<number, number>();
+    let i = 0;
+    for (const section of firmSections) {
+      for (const item of section.items) {
+        toIndex.set(item.transactionId, i);
+        toTxId.set(i, item.transactionId);
+        i++;
       }
     }
-    return [...groups.values()];
-    // resolveFirm reads session.firmOverrides; include it + customers in deps
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visibleRows, session.firmOverrides, session.customers]);
+    return { toIndex, toTxId, size: i };
+  }, [firmSections]);
 
-  // Flatten all selected txIds (across rows) for the copy / charge action bar.
-  const allSelectedIds = useMemo(
-    () => flattenSelection(rows, selected),
-    [rows, selected],
-  );
+  /**
+   * Tek txId toggle + range selection. Event modifier'ları:
+   *
+   *   plain click      → tek toggle, anchor = txId
+   *   shift+click      → [anchor, txId] aralığındaki TÜM txId'leri SEÇ
+   *                      (anchor değişmez; zincirleme range için)
+   *   ctrl+shift+click → [anchor, txId] aralığındaki TÜM txId'leri
+   *                      SEÇİMDEN ÇIKAR (seçili bloğu temizle)
+   *
+   * Hard rule: sadece onClick'ten çağrılır — scheduler / useEffect yok.
+   */
+  const toggleTx = (
+    txId: number,
+    event?: { shiftKey: boolean; ctrlKey: boolean; metaKey: boolean },
+  ) => {
+    const shift = event?.shiftKey ?? false;
+    const ctrl = event?.ctrlKey || event?.metaKey || false;
 
-  // Group selected ids by row so we can charge them as ONE POST per row
-  // (the row's firm is fixed). Pure helper — `groupSelectionByRow` only
-  // returns ids that intersect with the row's actual matches, so stale
-  // selection state can never leak through.
-  const selectedByRow = useMemo(
-    () => groupSelectionByRow(rows, selected),
-    [rows, selected],
-  );
+    // Plain click: toggle + anchor güncelle.
+    if (!shift) {
+      setSelected((cur) => {
+        const next = new Set(cur);
+        if (next.has(txId)) next.delete(txId);
+        else next.add(txId);
+        return next;
+      });
+      setAnchor(txId);
+      return;
+    }
 
-  const toggleExpanded = (id: string) => {
-    setExpanded((cur) => {
+    // Shift var → range modu. Anchor yoksa hedefin kendisini anchor
+    // olarak kullan (range = tek txId).
+    const anchorId = anchor ?? txId;
+    const aIdx = txIdIndex.toIndex.get(anchorId);
+    const bIdx = txIdIndex.toIndex.get(txId);
+    if (aIdx == null || bIdx == null) {
+      // Anchor ekranda yok (charged/reassign edilmiş). Plain toggle'a
+      // düş ki operatör kilitlenmesin.
+      setSelected((cur) => {
+        const next = new Set(cur);
+        if (next.has(txId)) next.delete(txId);
+        else next.add(txId);
+        return next;
+      });
+      setAnchor(txId);
+      return;
+    }
+    const [lo, hi] = aIdx <= bIdx ? [aIdx, bIdx] : [bIdx, aIdx];
+
+    setSelected((cur) => {
       const next = new Set(cur);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
+      for (let i = lo; i <= hi; i++) {
+        const id = txIdIndex.toTxId.get(i);
+        if (id == null) continue;
+        if (ctrl) next.delete(id);   // ctrl+shift → range UNSELECT
+        else next.add(id);            // shift       → range SELECT
+      }
       return next;
     });
+    // Anchor shift'te değişmez — zincirleme range için sabit kalsın.
   };
 
-  const toggleTxSelected = (rowGroup: string, txId: number) => {
+  const toggleSectionAll = (rowGroupIds: number[]) => {
     setSelected((cur) => {
-      const next = new Map(cur);
-      const inner = new Set(next.get(rowGroup) ?? []);
-      if (inner.has(txId)) inner.delete(txId);
-      else inner.add(txId);
-      if (inner.size === 0) next.delete(rowGroup);
-      else next.set(rowGroup, inner);
+      const next = new Set(cur);
+      const allSelected = rowGroupIds.every((id) => next.has(id));
+      if (allSelected) {
+        for (const id of rowGroupIds) next.delete(id);
+      } else {
+        for (const id of rowGroupIds) next.add(id);
+      }
       return next;
     });
   };
 
-  const toggleRowAll = (row: KeywordRow) => {
-    setSelected((cur) => {
-      const next = new Map(cur);
-      const curSet = next.get(row.group);
-      const allIds = new Set(row.matches.map((m) => m.transactionId));
-      // If everything is already selected, deselect all.
-      const fullySelected = curSet && [...allIds].every((id) => curSet.has(id));
-      if (fullySelected) next.delete(row.group);
-      else next.set(row.group, allIds);
-      return next;
-    });
+  const clearSelection = () => {
+    setSelected(new Set());
+    // Anchor da sıfırlansın — sonraki shift+click eski anchor'dan yanlış
+    // range seçmesin.
+    setAnchor(null);
+    // Reset the bulk-reassign target so the picker doesn't carry over a
+    // stale firm into the next selection.
+    setBulkFirmChoice("");
   };
 
-  const clearSelection = () => setSelected(new Map());
+  // --- Reassign + charge ----------------------------------------------------
 
-  const setRowFirm = async (row: KeywordRow, accountEuId: string) => {
+  /**
+   * Per-tx reassign. Yeni session.txFirmOverrides kaydı yaratır/siler.
+   * "Codec" seçilirse reassign KALDIRILIR (varsayılan Codec fallback'e
+   * düşsün). Section'ın kendisi de reassign sonrası otomatik olarak
+   * `groupByFirm`'in bir sonraki render'ında yeni section'a taşınır.
+   */
+  const setTxFirm = async (txId: number, accountEuId: string) => {
     const customer = customersById.get(accountEuId);
-    const accountName = customer?.name ?? row.suggestedAccountName ?? null;
-    const next = {
-      ...session,
-      firmOverrides: {
-        ...session.firmOverrides,
-        [row.group]: { accountEuId, accountName },
-      },
-    };
+    // Codec fallback is a fixed HAR-derived UUID — there's no customer
+    // record for it. The override must SET CODEC_ACCOUNT_EU_ID, not
+    // delete the entry (deleting would fall back to the AI's original
+    // suggestion, defeating the reassign).
+    const accountName =
+      accountEuId === CODEC_ACCOUNT_EU_ID
+        ? CODEC_ACCOUNT_NAME
+        : (customer?.name ?? null);
+    const nextOverrides = { ...session.txFirmOverrides };
+    nextOverrides[txId] = { accountEuId, accountName };
+    const next: SessionState = { ...session, txFirmOverrides: nextOverrides };
+    // Reassign tamamlandığında txId farklı section'a taşınır; selection
+    // artık eski section'a ait olduğu için operatör için anlamsız.
+    // Hemen temizle ki toolbar sayaç güncellensin ve eski section'da
+    // "seçili" rozeti kalmasın.
+    setSelected((cur) => {
+      if (!cur.has(txId)) return cur;
+      const next = new Set(cur);
+      next.delete(txId);
+      return next;
+    });
     setSession(next);
-    await saveSession(next);
-  };
-
-  const resolveFirm = (row: KeywordRow) => {
-    const override = session.firmOverrides[row.group];
-    if (override) return override;
-    return {
-      accountEuId: row.suggestedAccountEuId ?? "00000000-0000-0000-0000-000000000000",
-      accountName: row.suggestedAccountName ?? "Codec",
-    };
+    try {
+      await saveSession(next);
+    } catch (err) {
+      // Persist başarısızsa UI'ı geri al; operatör reassign uygulandı sanıp
+      // charge ederse yanlış firmaya gidebilir.
+      setSession(session);
+      toast.push(
+        `txId reassign kaydedilemedi: ${err instanceof Error ? err.message : String(err)}`,
+        "error",
+      );
+    }
   };
 
   /**
-   * Charge the given transactionIds to `firm` with ONE POST.
+   * Toplu reassign: seçili tüm txId'leri tek firmaya yönlendir.
+   * Per-tx `setTxFirm` mantığının batched versiyonu — tek `setSession` +
+   * tek `saveSession` çağrısı, N kez yerine. Selection korunur (charge
+   * için), kullanıcı isterse "Temizle" ile sıfırlar.
    *
-   * The backend's `/Charged` endpoint accepts an array of ids in a single
-   * call, so we don't loop over them in the extension. This is the only
-   * way the UI ever talks to the charge endpoint; the loop here exists
-   * only to update the UI map and persist the audit record.
+   * Hard rule: bu fonksiyon YALNIZCA toolbar'daki "Uygula" butonunun
+   * onClick'inden çağrılır. `chargeOnce` çağırmaz, sadece
+   * `txFirmOverrides` map'ini günceller — yani seçili txId'lerin
+   * POST'a gönderilmesi için ayrıca bir section "Ücretlendir" tıklaması
+   * gerekir (mevcut güvenlik akışı bozulmaz).
    *
-   * Whatever the backend says (success or error) is logged to the audit
-   * log. On success the ids are appended to `session.chargedIds` and
-   * cleared from the current selection so the action bar doesn't offer
-   * them again.
+   * Edge cases:
+   * - Hedef firma seçilmemişse no-op (buton zaten disabled ama defense).
+   * - Selection boşsa no-op.
+   * - Hedef zaten tüm seçili txId'lerin firmasıysa no-op (gereksiz
+   *   storage write'tan kaçınır).
    */
-  const chargeIdsSingleCall = async (
-    row: KeywordRow,
-    ids: number[],
-    firm: { accountEuId: string; accountName: string | null },
-  ): Promise<{ succeeded: number; failed: number; lastError: string | null }> => {
-    if (ids.length === 0) return { succeeded: 0, failed: 0, lastError: null };
+  const applyBulkReassign = async () => {
+    if (!bulkFirmChoice || selected.size === 0) return;
+    const customer = customersById.get(bulkFirmChoice);
+    const accountName =
+      bulkFirmChoice === CODEC_ACCOUNT_EU_ID
+        ? CODEC_ACCOUNT_NAME
+        : (customer?.name ?? null);
 
-    // Per-row UX: show every id as "running" → ok/fail atomically.
-    const initial = new Map<string, ItemProgress>();
-    for (const id of ids) initial.set(`${row.group}:${id}`, { id, state: "running" });
-    setChargeProgress(initial);
+    // Hızlı no-op kontrolü: seçili txId'lerin hepsi zaten hedef
+    // firmadaysa gereksiz yere session/storage yazma.
+    const allAlreadyTarget = Array.from(selected).every((txId) => {
+      const cur = session.txFirmOverrides[txId];
+      if (cur) return cur.accountEuId === bulkFirmChoice;
+      // txFirmOverride yoksa resolveFirmForTx çağrısı yapmadan
+      // basitleştirme: "any" — burada edge case ama büyük runlarda
+      // pratik olarak sık karşılaşılmaz (operator zaten seçip tıklıyor).
+      return false;
+    });
+    if (allAlreadyTarget) {
+      toast.push(
+        `Seçili ${selected.size} txId zaten "${accountName ?? "?"}" firmasında — değişiklik yok`,
+        "info",
+      );
+      setBulkFirmChoice("");
+      return;
+    }
 
-    let succeeded = 0;
-    let failed = 0;
-    let lastError: string | null = null;
+    // Snapshot selected count for the toast (clearSelection wipes the
+    // Set, so we need the count BEFORE we touch state).
+    const count = selected.size;
+
+    // Tek immutable güncelleme: önceki txFirmOverrides kopyala, seçili
+    // txId'lerin üstüne yeni {accountEuId, accountName} yaz.
+    const nextOverrides = { ...session.txFirmOverrides };
+    for (const txId of selected) {
+      nextOverrides[txId] = { accountEuId: bulkFirmChoice, accountName };
+    }
+    const next: SessionState = { ...session, txFirmOverrides: nextOverrides };
+    // Persist başarısız olursa selection'ı geri alabilmek için snapshot.
+    const prevSelected = selected;
+    // Reassign tamamlandığında txId'ler yeni section'a taşınır; eski
+    // section'daki selection anlamsız kalır. Hemen temizle ki:
+    //  - toolbar sayaç düşsün
+    //  - eski section'larda "seçili" rozeti kalmasın
+    //  - operatör yanlışlıkla eski selection üzerinden charge etmesin
+    setSelected(new Set());
+    setAnchor(null);
+    setSession(next);
+    // Toolbar'ı da kapat ki operatör ikinci kez reassign tetiklemesin.
+    setBulkFirmChoice("");
+
+    try {
+      await saveSession(next);
+      toast.push(
+        `${count} txId "${accountName ?? "?"}" firmasına yönlendirildi`,
+        "success",
+      );
+    } catch (err) {
+      // Persist başarısızsa UI'ı TAMAMEN geri al — selection dahil.
+      // Yoksa operatör reassign uygulandı sanıp eski selection üzerinden
+      // charge ederse yanlış firmaya gidebilir.
+      setSession(session);
+      setSelected(prevSelected);
+      toast.push(
+        `Toplu reassign kaydedilemedi: ${err instanceof Error ? err.message : String(err)}`,
+        "error",
+      );
+    }
+  };
+
+  /**
+   * Section'ın footer'ındaki "Ücretlendir" butonu. Cross-firm bulaşma
+   * savunmasının 2. katmanı burada:
+   *
+   *   1. POST'a gönderilecek HER txId'i `resolveFirmForTx` ile yeniden
+   *      çöz. Section başlığındaki accountEuId'ye GÜVENME — render arasında
+   *      yapılmış reassign'ı kaçırırsın.
+   *   2. Çözünlenen firmaların `Set<accountEuId>.size > 1` ise POST'a
+   *      HİÇ GEÇME; toast ile operator'ı uyar.
+   *   3. Çözünlenen firmaların hepsi aynıysa, tek firmaya charge et.
+   *   4. TxId hâlâ section'daysa ama artık section.accountEuId'ye
+   *      çözünmüyorsa (reassign olmuş), sessizce DROPPED listesine ekle.
+   *      Plan'daki "geçersiz txId'i otomatik dropped" davranışı.
+   *
+   * `chargeOnce`'daki `validateAccountEuId` (null/"null"/<32 char guard)
+   * 3. katman — handler burada onu zaten geçerli bir UUID ile çağırır,
+   * ama defense-in-depth olarak orada da kontrol var.
+   */
+  const chargeFirm = async (
+    section: { firmKey: string; accountEuId: string; accountName: string | null; items: { transactionId: number; row: KeywordRow }[] },
+    requestedIds: number[],
+  ): Promise<void> => {
+    if (requestedIds.length === 0) return;
+
+    // (1) HER txId'i yeniden çöz.
+    type Resolved = { txId: number; firm: Firm };
+    const resolved: Resolved[] = [];
+    const dropped: number[] = [];
+    for (const id of requestedIds) {
+      const item = section.items.find((it) => it.transactionId === id);
+      if (!item) {
+        // Section artık bu txId'i içermiyor — render arası reassign.
+        dropped.push(id);
+        continue;
+      }
+      const firm = resolveFirmForTx(
+        id,
+        item.row,
+        session.firmOverrides,
+        session.txFirmOverrides,
+      );
+      if (firm.accountEuId !== section.accountEuId) {
+        // Bu txId artık başka bir firmaya ait (örn. reassign edildi).
+        dropped.push(id);
+        continue;
+      }
+      resolved.push({ txId: id, firm });
+    }
+
+    if (resolved.length === 0) {
+      toast.push(
+        `${section.accountName ?? "?"}: seçili txId'lerin hepsi reassign edildi, charge iptal`,
+        "error",
+      );
+      return;
+    }
+
+    // (2) Çözünlenen firmaların hepsi AYNI olmalı. resolveFirmForTx zaten
+    // her txId için section.accountEuId döndürüyor (filter yukarıda), ama
+    // burada bir kez daha doğrulayalım — Pure helper invariant'ı.
+    const firmIds = new Set(resolved.map((r) => r.firm.accountEuId));
+    if (firmIds.size > 1) {
+      // Asla olmamalı (filter step garanti ediyor), ama defense-in-depth.
+      toast.push(
+        `${section.accountName ?? "?"}: ${firmIds.size} farklı firma tespit edildi — POST iptal (cross-firm bulaşma guard)`,
+        "error",
+      );
+      return;
+    }
+
+    const ids = resolved.map((r) => r.txId);
+    const firm = resolved[0].firm;
+
+    // (3) Optimistic update: chargedIds'e ekle, UI anında güncellensin.
+    const optimistic: SessionState = {
+      ...session,
+      chargedIds: [...session.chargedIds, ...ids],
+    };
+    const prevSession = session;
+    const prevSelected = selected;
+    // IDs to clear from selection: the ones we just charged, plus any
+    // we silently dropped because they were reassigned mid-flight.
+    // Clear them NOW so the toolbar's "X tx seçili" counter drops the
+    // moment the user clicks Ücretlendir — don't wait for the network.
+    const idsToClear = [...ids, ...dropped];
+    setSelected((cur) => {
+      const next = new Set(cur);
+      for (const id of idsToClear) next.delete(id);
+      return next;
+    });
+    setSession(optimistic);
+    setBusyFirm(section.firmKey);
+    setError(null);
 
     try {
       const result = await chargeOnce(
@@ -289,147 +650,63 @@ export function StepReview() {
         firm.accountEuId,
         firm.accountName,
         ids,
-        row.label,
+        section.firmKey,
+        settings.demoMode,
       );
       if (result.ok) {
-        succeeded = ids.length;
-        const finalMap = new Map<string, ItemProgress>();
-        for (const id of ids) finalMap.set(`${row.group}:${id}`, { id, state: "ok" });
-        setChargeProgress(finalMap);
-      } else {
-        // Backend said "no" — count the whole batch as failed (we can't
-        // tell which ids succeeded if the API rejected the array).
-        failed = ids.length;
-        lastError = result.record.resultDetails;
-        const finalMap = new Map<string, ItemProgress>();
-        for (const id of ids) {
-          finalMap.set(`${row.group}:${id}`, {
-            id,
-            state: "fail",
-            error: result.record.resultDetails,
-          });
-        }
-        setChargeProgress(finalMap);
-      }
-    } catch (err) {
-      failed = ids.length;
-      lastError = err instanceof Error ? err.message : String(err);
-      const finalMap = new Map<string, ItemProgress>();
-      for (const id of ids) {
-        finalMap.set(`${row.group}:${id}`, {
-          id,
-          state: "fail",
-          error: lastError,
-        });
-      }
-      setChargeProgress(finalMap);
-    }
-
-    if (succeeded > 0) {
-      const next = {
-        ...session,
-        chargedIds: [...session.chargedIds, ...ids],
-      };
-      setSession(next);
-      await saveSession(next);
-      setSelected((cur) => {
-        const inner = cur.get(row.group);
-        if (!inner) return cur;
-        const chargedSet = new Set(ids);
-        const remaining = new Set([...inner].filter((id) => !chargedSet.has(id)));
-        const nextMap = new Map(cur);
-        if (remaining.size === 0) nextMap.delete(row.group);
-        else nextMap.set(row.group, remaining);
-        return nextMap;
-      });
-    }
-
-    return { succeeded, failed, lastError };
-  };
-
-  const chargeRow = async (row: KeywordRow, ids?: number[]) => {
-    const firm = resolveFirm(row);
-    if (!firm.accountEuId) return;
-    const targets = ids ?? row.matches.map((m) => m.transactionId);
-    if (targets.length === 0) return;
-    setBusyRow(row.group);
-    setError(null);
-
-    // --- Optimistic update ---------------------------------------------
-    // Drop the txIds from the UI immediately so the operator sees the row
-    // shrink / disappear without waiting for the network round-trip. If
-    // the POST fails, we roll back to the previous session below.
-    const optimistic: SessionState = {
-      ...session,
-      chargedIds: [...session.chargedIds, ...targets],
-    };
-    const prevSession = session;
-    setSession(optimistic);
-
-    try {
-      const { succeeded, failed, lastError } = await chargeIdsSingleCall(row, targets, firm);
-      if (failed === 0) {
-        // Persist the optimistic update — the optimistic session already
-        // has the ids appended, so saveSession will write the new set.
         await saveSession(optimistic);
+        const dropMsg =
+          dropped.length > 0
+            ? ` (${dropped.length} txId reassign edildiği için dropped)`
+            : "";
         toast.push(
-          `${row.label}: ${succeeded} kayıt tek istekte ${firm.accountName ?? "?"} firmasına gönderildi`,
+          `${firm.accountName ?? "?"}: ${ids.length} txId tek istekte gönderildi${dropMsg}`,
           "success",
         );
       } else {
-        // Rollback the optimistic append; keep `selected` as-is so the
-        // operator can fix and retry without re-selecting the rows.
+        // Server-side reject: rollback both session AND selection so the
+        // operator can retry. The just-charged ids need to come back
+        // into the selection set — they were never actually charged.
         setSession(prevSession);
+        setSelected(prevSelected);
         toast.push(
-          `${row.label}: ${succeeded} başarılı, ${failed} hata — ${lastError ?? ""}`,
+          `${firm.accountName ?? "?"}: ${result.record.resultDetails ?? "hata"}`,
           "error",
         );
-        setError(lastError);
+        setError(result.record.resultDetails ?? null);
       }
     } catch (err) {
-      // Network / thrown error → rollback so the txIds remain in the row.
+      // Network / client-side error: same rollback as above.
       setSession(prevSession);
+      setSelected(prevSelected);
       const msg = err instanceof Error ? err.message : String(err);
-      toast.push(`${row.label}: charge başarısız — ${msg}`, "error");
+      toast.push(`${firm.accountName ?? "?"}: charge başarısız — ${msg}`, "error");
       setError(msg);
     } finally {
-      setBusyRow(null);
-      setTimeout(() => setChargeProgress(null), 1500);
+      setBusyFirm(null);
     }
   };
 
-  const chargeAllSelected = async () => {
-    if (selectedByRow.length === 0) return;
-    // Each selected row is charged as ONE POST per row (the row's firm
-    // is fixed). We process rows sequentially so audit log entries are
-    // ordered and throttle settings still apply between rows.
-    for (const { row, ids } of selectedByRow) {
-      if (ids.length === 0) continue;
-      await chargeRow(row, ids);
-      if (settings.throttleMs > 0) {
-        await new Promise((r) => setTimeout(r, settings.throttleMs));
-      }
-    }
-  };
-
-  const copySelected = async () => {
-    if (allSelectedIds.length === 0) return;
-    const ids = allSelectedIds.map((x) => x.txId);
+  /**
+   * Tek txId'i tablodan kaldır (charge etmeden). `session.ignoredIds`'e
+   * eklenir, `buildKeywordRows` filtreler.
+   */
+  const removeTxId = async (txId: number) => {
+    const currentIgnored = session.ignoredIds ?? [];
+    if (currentIgnored.includes(txId)) return;
+    const next = { ...session, ignoredIds: [...currentIgnored, txId] };
+    setSession(next);
     try {
-      await navigator.clipboard.writeText(formatTxIds(ids, copyFormat));
-      toast.push(
-        `${ids.length} txId ${COPY_FORMAT_LABEL[copyFormat]} olarak kopyalandı`,
-        "success",
-      );
+      await saveSession(next);
     } catch (err) {
+      setSession(session);
       toast.push(
-        `Kopyalama başarısız: ${err instanceof Error ? err.message : String(err)}`,
+        `txId kaldırılamadı: ${err instanceof Error ? err.message : String(err)}`,
         "error",
       );
     }
   };
 
-  // Copy a single txId from the row's expanded list.
   const copySingle = async (txId: number) => {
     try {
       await navigator.clipboard.writeText(String(txId));
@@ -442,26 +719,66 @@ export function StepReview() {
     }
   };
 
+  /**
+   * Seçili txId'leri istenen formatta clipboard'a kopyala. Caller her
+   * section'ın kendi footer'ındaki buton grubundan tetikler; formatTxIdsForCopy
+   * pure helper, UI sadece sonucu panoya yazar.
+   *
+   * Hard rule: bu fonksiyon YALNIZCA button.onClick'ten çağrılır
+   * (useEffect / scheduler YOK). Şu an mock ortamda bile olsa production'da
+   * clipboard API'si ancak user-gesture içinde çalışır.
+   */
+  const copySelection = async (
+    ids: number[],
+    format: BulkCopyFormat,
+    sectionLabel: string,
+  ) => {
+    if (ids.length === 0) {
+      toast.push("Kopyalanacak seçili txId yok", "error");
+      return;
+    }
+    const text = formatTxIdsForCopy(ids, format);
+    if (text === null) {
+      toast.push("Kopyalanacak seçili txId yok", "error");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      toast.push(
+        `${sectionLabel}: ${ids.length} txId ${bulkCopyLabel(format)} formatında kopyalandı`,
+        "success",
+      );
+    } catch (err) {
+      toast.push(
+        `Kopyalama başarısız: ${err instanceof Error ? err.message : String(err)}`,
+        "error",
+      );
+    }
+  };
+
+  // --- Özet sayaçları ------------------------------------------------------
+
   const totalItems = rows.reduce((sum, r) => sum + r.matches.length, 0);
   const chargedTotal = session.chargedIds.length;
-  const remaining = totalItems - chargedTotal;
+  const selectedTotal = selected.size;
 
   return (
     <div className="section review-page">
       <h2>İncele & Ücretlendir</h2>
       <p className="muted" style={{ fontSize: 11, marginTop: 0 }}>
-        AI'ın grupladığı öneriler. Her satırda firmayı değiştirebilir, tek tek
-        veya toplu halde işaretleyebilirsin. <strong>Sarı butonlara basmadıkça
-        hiçbir istek gitmez.</strong>
+        AI'ın önerileri firma düzeyinde gruplanır — her firmanın tüm txId'leri
+        tek tabloda görünür. Satır başındaki dropdown ile bir txId'i başka bir
+        firmaya yönlendirebilirsin. <strong>Sarı butonlara basmadıkça hiçbir
+        istek gitmez.</strong>
       </p>
 
       <div className="summary">
         <div>
-          <div className="num">{rows.length.toLocaleString("tr-TR")}</div>
-          <div className="lbl">satır</div>
+          <div className="num">{firmSections.length.toLocaleString("tr-TR")}</div>
+          <div className="lbl">firma</div>
         </div>
         <div>
-          <div className="num">{remaining.toLocaleString("tr-TR")}</div>
+          <div className="num">{totalItems.toLocaleString("tr-TR")}</div>
           <div className="lbl">bekleyen kayıt</div>
         </div>
         <div>
@@ -470,12 +787,20 @@ export function StepReview() {
           </div>
           <div className="lbl">gönderildi</div>
         </div>
-        {allSelectedIds.length > 0 && (
+        {selectedTotal > 0 && (
           <div>
             <div className="num" style={{ color: "var(--accent)" }}>
-              {allSelectedIds.length.toLocaleString("tr-TR")}
+              {selectedTotal.toLocaleString("tr-TR")}
             </div>
             <div className="lbl">seçili</div>
+            <button
+              className="ghost sm"
+              onClick={clearSelection}
+              title="Seçimi temizle"
+              style={{ marginTop: 2 }}
+            >
+              <X size={10} /> temizle
+            </button>
           </div>
         )}
       </div>
@@ -496,12 +821,27 @@ export function StepReview() {
               onClick={() => setFilter(f)}
               className={filter === f ? "primary" : ""}
             >
-              {f === "all" ? "Tümü" :
-               f === "high" ? "Yüksek" :
-               f === "medium" ? "Orta" :
-               f === "low" ? "Düşük" : "Codec"}
+              {f === "all"
+                ? "Tümü"
+                : f === "high"
+                  ? "Yüksek"
+                  : f === "medium"
+                    ? "Orta"
+                    : f === "low"
+                      ? "Düşük"
+                      : "Codec"}
             </button>
           ))}
+          <button
+            onClick={() => setShowMsgContent((v) => !v)}
+            className={showMsgContent ? "primary" : ""}
+            title={
+              showMsgContent ? "msgContent sütununu gizle" : "msgContent sütununu göster"
+            }
+          >
+            <MessageSquare size={11} />
+            Msg içeriği
+          </button>
         </div>
         <div className="toolbar-row toolbar-search">
           <Search size={11} style={{ verticalAlign: "middle" }} />
@@ -518,196 +858,96 @@ export function StepReview() {
             </button>
           )}
         </div>
+        {selectedTotal > 0 && (
+          <div
+            className="toolbar-row toolbar-bulk"
+            role="region"
+            aria-label="Toplu firm yönlendirme"
+          >
+            <span className="toolbar-bulk__count">
+              <CheckSquare size={11} color="var(--accent)" />
+              <strong>{selectedTotal}</strong> tx seçili
+            </span>
+            <select
+              className="toolbar-bulk__firm"
+              value={bulkFirmChoice}
+              onChange={(e) => setBulkFirmChoice(e.target.value)}
+              title="Seçili txId'leri yönlendirmek istediğin firma"
+              aria-label="Hedef firma"
+            >
+              <option value="">Hedef firma seç…</option>
+              <option value={CODEC_ACCOUNT_EU_ID}>Codec (fallback)</option>
+              {session.customers.map((c) => (
+                <option key={c.acntEuId} value={c.acntEuId}>
+                  {c.name}
+                </option>
+              ))}
+            </select>
+            <button
+              className="primary sm"
+              disabled={!bulkFirmChoice}
+              onClick={applyBulkReassign}
+              title={`Seçili ${selectedTotal} txId'i seçili firmaya yönlendir (charge etmez)`}
+            >
+              <ArrowRight size={11} />
+              Yönlendir
+            </button>
+            <button
+              className="ghost sm"
+              onClick={() => {
+                clearSelection();
+                setBulkFirmChoice("");
+              }}
+              title="Seçimi temizle"
+            >
+              <X size={10} />
+              Temizle
+            </button>
+          </div>
+        )}
       </div>
 
-      {visibleRows.length === 0 ? (
+      {phase === "skeleton" ? (
+        <ReviewSkeleton matchesHint={matchesLen} />
+      ) : firmSections.length === 0 ? (
         <div className="empty">
           <ListChecks size={32} className="icon" />
-          <div className="title">Bu filtreyle eşleşen satır yok</div>
+          <div className="title">Bu filtreyle eşleşen firma yok</div>
           <div className="hint">
             Filtreyi değiştir veya Analiz sekmesinden yeni bir çalışma tetikle.
           </div>
         </div>
       ) : (
         <div className="review-table">
-          <div className="review-table__head">
-            <div className="col col-check">
-              <span title="Tümünü seç" aria-hidden>
-                {/* header checkbox placeholder */}
-              </span>
-            </div>
-            <div className="col col-label">Keyword / Satır</div>
-            <div className="col col-firm">Firma</div>
-            <div className="col col-count">#</div>
-            <div className="col col-conf">Güven</div>
-            <div className="col col-actions">İşlem</div>
-          </div>
-
-          {firmGroupedRows.flatMap((group) => {
-            // Each firm-group renders a header banner + its child rows
-            // (rows inside stay independently chargeable; this is
-            // visual grouping only — same as Plan §B.3).
-            const header = (
-              <div
-                key={`firm-${group.firmKey}`}
-                className="review-firm-section__head"
-              >
-                <span className="pill sm accent">{group.firmName}</span>
-                <span className="muted" style={{ fontSize: 10.5 }}>
-                  {group.rows.length} keyword grubu ·{" "}
-                  {group.rows.reduce((s, r) => s + r.matches.length, 0)} tx
-                </span>
-              </div>
-            );
-            const rowEls = group.rows.map((row) => {
-              const isExpanded = expanded.has(row.group);
-              const isBusy = busyRow === row.group;
-              const isCodec = row.group === "__codec_fallback__";
-              const selectedIds = selected.get(row.group) ?? new Set<number>();
-              const firm = resolveFirm(row);
-              const overrideKey = session.firmOverrides[row.group];
-              const fullySelected =
-                selectedIds.size > 0 &&
-                selectedIds.size === row.matches.length;
-              const someSelected =
-                selectedIds.size > 0 && selectedIds.size < row.matches.length;
-
-              return (
-                <div
-                  key={row.group}
-                  className={`review-row ${isCodec ? "codec" : row.worstConfidence}${overrideKey ? " overridden" : ""}${isExpanded ? " expanded" : ""}`}
-                >
-                  <div
-                    className="review-row__head"
-                    onClick={() => toggleExpanded(row.group)}
-                  >
-                    <div
-                      className="col col-check"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        toggleRowAll(row);
-                      }}
-                    >
-                      {fullySelected ? (
-                        <CheckSquare size={14} color="var(--accent)" />
-                      ) : someSelected ? (
-                        <CheckSquare size={14} color="var(--accent)" style={{ opacity: 0.5 }} />
-                      ) : (
-                        <Square size={14} color="var(--text-2)" />
-                      )}
-                    </div>
-                    <div className="col col-label">
-                      <div className="row-label">{row.label}</div>
-                      <div className="row-meta">
-                        <span className="pill sm">{row.dominantField}</span>
-                        {overrideKey && <span className="pill sm warn">override</span>}
-                        {selectedIds.size > 0 && (
-                          <span className="pill sm accent">
-                            {selectedIds.size} seçili
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                    <div className="col col-firm" onClick={(e) => e.stopPropagation()}>
-                      <select
-                        value={firm.accountEuId}
-                        onChange={(e) => setRowFirm(row, e.target.value)}
-                        title={firm.accountName ?? ""}
-                      >
-                        <option value="00000000-0000-0000-0000-000000000000">
-                          Codec (fallback)
-                        </option>
-                        {session.customers.map((c) => (
-                          <option key={c.acntEuId} value={c.acntEuId}>
-                            {c.name}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                    <div className="col col-count">
-                      {row.matches.length}
-                    </div>
-                    <div className="col col-conf">
-                      <span className={`pill ${row.worstConfidence}`}>
-                        {row.worstConfidence}
-                      </span>
-                    </div>
-                    <div className="col-actions col-actions-extra">
-                      <button
-                        className="primary sm"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          chargeRow(row);
-                        }}
-                        disabled={isBusy || row.matches.length === 0}
-                        title={`Tüm ${row.matches.length} txId'i tek istekle ${firm.accountName ?? "?"} firmasına gönder`}
-                      >
-                        {isBusy ? (
-                          <Loader2 size={11} className="spin" />
-                        ) : (
-                          <Zap size={11} />
-                        )}
-                        Tümü ({row.matches.length})
-                      </button>
-                      <button
-                        className="ghost"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          toggleExpanded(row.group);
-                        }}
-                        title={isExpanded ? "Listeyi gizle" : "txId listesini göster"}
-                      >
-                        {isExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-                      </button>
-                    </div>
-                  </div>
-
-                  {isExpanded && (
-                    <TxIdList
-                      row={row}
-                      selectedIds={selectedIds}
-                      itemsById={itemsById}
-                      isBusy={isBusy}
-                      chargeProgress={chargeProgress}
-                      onToggle={(tx) => toggleTxSelected(row.group, tx)}
-                      onCopy={(tx) => copySingle(tx)}
-                      onChargeOne={(tx) => chargeRow(row, [tx])}
-                      firmName={firm.accountName ?? "?"}
-                    />
-                  )}
-
-                  {isBusy && chargeProgress && chargeProgress.size > 0 && (
-                    <ChargeProgressStrip
-                      row={row}
-                      progress={Array.from(chargeProgress.values())}
-                    />
-                  )}
-                </div>
-              );
-            });
-            return [header, ...rowEls];
-          })}
+          {firmSections.map((section) => (
+            <FirmSectionView
+              key={section.firmKey}
+              section={section}
+              customers={session.customers}
+              itemsById={itemsById}
+              selected={selected}
+              busy={busyFirm === section.firmKey}
+              showMsgContent={showMsgContent}
+              onToggle={toggleTx}
+              onToggleSectionAll={toggleSectionAll}
+              onCharge={(ids) => chargeFirm(section, ids)}
+              onSetTxFirm={setTxFirm}
+              onCopy={copySingle}
+              onBulkCopy={(ids, fmt) =>
+                copySelection(ids, fmt, section.accountName ?? "?")
+              }
+              onRemove={removeTxId}
+            />
+          ))}
         </div>
-      )}
-
-      {/* Sticky action bar — appears whenever ≥1 txId is selected. */}
-      {allSelectedIds.length > 0 && (
-        <ActionBar
-          count={allSelectedIds.length}
-          rowCount={selectedByRow.length}
-          format={copyFormat}
-          onFormatChange={setCopyFormat}
-          onCopy={copySelected}
-          onCharge={chargeAllSelected}
-          onClear={clearSelection}
-        />
       )}
 
       <div className="muted" style={{ marginTop: 16, fontSize: 11 }}>
         🛡️ <strong>Güvenlik:</strong> AI hiçbir zaman otomatik POST atmaz.
-        Seçili txId'leri ücretlendir butonu <em>sen tıklayana kadar</em>{" "}
-        hiçbir şey göndermez. Gönderilen her istek Geçmiş sekmesinde audit
-        log'a yazılır.
+        Ücretlendir butonu <em>sen tıklayana kadar</em> hiçbir şey göndermez.
+        Charge anında her txId yeniden çözümlenir — reassign edilmiş txId'ler
+        "dropped" sayılır, asla yanlış firmaya gönderilmez. Gönderilen her
+        istek Geçmiş sekmesinde audit log'a yazılır.
       </div>
     </div>
   );
@@ -715,170 +955,318 @@ export function StepReview() {
 
 // --- Sub-components --------------------------------------------------------
 
-function TxIdList({
-  row,
-  selectedIds,
-  itemsById,
-  isBusy,
-  chargeProgress,
-  onToggle,
-  onCopy,
-  onChargeOne,
-  firmName,
-}: {
-  row: KeywordRow;
-  selectedIds: Set<number>;
+interface FirmSectionViewProps {
+  section: import("../../lib/ai.js").FirmSection;
+  customers: Customer[];
   itemsById: Map<number, UnmatchedItem>;
-  isBusy: boolean;
-  chargeProgress: Map<string, ItemProgress> | null;
-  onToggle: (txId: number) => void;
-  onCopy: (txId: number) => void;
-  onChargeOne: (txId: number) => void;
-  firmName: string;
-}) {
-  return (
-    <div className="txid-list">
-      {row.matches.slice(0, 200).map((m) => {
-        const it = itemsById.get(m.transactionId);
-        const isSelected = selectedIds.has(m.transactionId);
-        const cp = chargeProgress?.get(`${row.group}:${m.transactionId}`);
-        const cpState = cp?.state;
-        return (
-          <div
-            key={m.transactionId}
-            className={`txid-row${isSelected ? " selected" : ""}${cpState ? ` cp-${cpState}` : ""}`}
-          >
-            <button
-              className="txid-row__check"
-              onClick={() => onToggle(m.transactionId)}
-              disabled={isBusy}
-              title={isSelected ? "Seçimi kaldır" : "Seç"}
-            >
-              {isSelected ? (
-                <CheckSquare size={11} color="var(--accent)" />
-              ) : (
-                <Square size={11} color="var(--text-2)" />
-              )}
-            </button>
-            <span className="txid-row__id">#{m.transactionId}</span>
-            <span className="txid-row__field">[{m.matchedField}]</span>
-            <span className="txid-row__kw" title={m.matchedValue}>
-              {m.matchedValue.slice(0, 40)}
-            </span>
-            {it && <span className="txid-row__phone">{it.phone}</span>}
-            <button
-              className="txid-row__copy ghost"
-              onClick={() => onCopy(m.transactionId)}
-              title="txId'i kopyala"
-            >
-              <Copy size={10} />
-            </button>
-            <button
-              className="txid-row__charge"
-              onClick={() => onChargeOne(m.transactionId)}
-              disabled={isBusy}
-              title={`Sadece bu txId'i ${firmName} firmasına gönder`}
-              aria-label="Ücretlendir"
-            >
-              <Zap size={10} />
-            </button>
-            {cpState && (
-              <span className={`txid-row__status cp-${cpState}`}>
-                {cpState === "ok" ? "✓" : cpState === "fail" ? "✗" : "…"}
-              </span>
-            )}
-          </div>
-        );
-      })}
-      {row.matches.length > 200 && (
-        <div className="muted txid-list__more">
-          … ve {row.matches.length - 200} satır daha
-        </div>
-      )}
-    </div>
-  );
+  selected: Set<number>;
+  busy: boolean;
+  showMsgContent: boolean;
+  /**
+   * Toggle a single txId. Optional event param drives shift+click
+   * range selection at the parent (see StepReview.toggleTx).
+   */
+  onToggle: (
+    txId: number,
+    event?: { shiftKey: boolean; ctrlKey: boolean; metaKey: boolean },
+  ) => void;
+  onToggleSectionAll: (ids: number[]) => void;
+  onCharge: (ids: number[]) => void | Promise<void>;
+  onSetTxFirm: (txId: number, accountEuId: string) => void | Promise<void>;
+  onCopy: (txId: number) => void | Promise<void>;
+  onBulkCopy: (ids: number[], format: BulkCopyFormat) => void | Promise<void>;
+  onRemove: (txId: number) => void | Promise<void>;
 }
 
-function ChargeProgressStrip({
-  row,
-  progress,
-}: {
-  row: KeywordRow;
-  progress: ItemProgress[];
-}) {
-  const total = progress.length;
-  // All ids enter "running" together, then flip atomically to ok/fail —
-  // because the row's charge is exactly ONE POST. The bar is therefore a
-  // simple indeterminate indicator: in-flight or done.
-  const allDone = progress.every((p) => p.state === "ok" || p.state === "fail");
-  const okCount = progress.filter((p) => p.state === "ok").length;
-  const failCount = progress.filter((p) => p.state === "fail").length;
+/**
+ * Bir firma = bir section. İçinde tüm txId'ler düz tabloda, satır başına
+ * inline reassign dropdown'ı, footer'da "Seçili (N) Ücretlendir" butonu.
+ *
+ * ÖNEMLİ: Footer butonu SADECE bu section'ın txId'lerini charge eder.
+ * Cross-firm bulaşma riski YOK — UI hiçbir zaman birden fazla firmayı
+ * tek tıklamayla POST'lamaz (eski global ActionBar kaldırıldı).
+ */
+function FirmSectionView({
+  section,
+  customers,
+  itemsById,
+  selected,
+  busy,
+  showMsgContent,
+  onToggle,
+  onToggleSectionAll,
+  onCharge,
+  onSetTxFirm,
+  onCopy,
+  onBulkCopy,
+  onRemove,
+}: FirmSectionViewProps) {
+  const totalIds = section.items.length;
+  const allIds = useMemo(
+    () => section.items.map((it) => it.transactionId),
+    [section.items],
+  );
+  const allSelected =
+    allIds.length > 0 && allIds.every((id) => selected.has(id));
+  const someSelected =
+    !allSelected && allIds.some((id) => selected.has(id));
+  const isCodec = section.accountEuId === CODEC_ACCOUNT_EU_ID;
+  const txOverridesCount = section.items.filter(
+    (it) => it.source === "tx-override",
+  ).length;
+
   return (
-    <div className="charge-progress">
-      <div className="charge-progress__head">
-        {allDone ? (
-          <span>
-            {failCount === 0 ? "✓" : "⚠"} {row.label}: tek istekte {okCount}/{total} başarılı
-          </span>
-        ) : (
-          <span>
-            <Loader2 size={12} className="spin" /> {row.label}: tek istekle
-            {" "}{total} txId gönderiliyor…
-          </span>
-        )}
-        <span>
-          {okCount}✓ / {failCount}✗ · {total}
+    <section
+      className={`review-firm-section ${isCodec ? "codec" : ""}`}
+      data-firm-key={section.firmKey}
+    >
+      <div className="review-firm-section__head">
+        <span className={`pill sm ${isCodec ? "warn" : "accent"}`}>
+          {section.accountName ?? "Bilinmeyen firma"}
+        </span>
+        <span className="muted" style={{ fontSize: 10.5 }}>
+          {totalIds} tx · {section.selectedCount} seçili
+          {txOverridesCount > 0 && (
+            <>
+              {" "}
+              · <strong>{txOverridesCount}</strong> reassign
+            </>
+          )}
         </span>
       </div>
-      <div className="charge-progress__bar">
-        <span style={{ width: `${allDone ? 100 : 60}%` }} />
+
+      {!isCodec && section.accountEuId && (
+        <FirmOverrideMini
+          accountEuId={section.accountEuId}
+          accountName={section.accountName ?? "Bilinmeyen firma"}
+        />
+      )}
+
+      <table className="review-tx-table">
+        <thead>
+          <tr>
+            <th className="tx-check">
+              <button
+                className="tx-row__check ghost"
+                onClick={() => onToggleSectionAll(allIds)}
+                title={allSelected ? "Tümünü seçimi kaldır" : "Tümünü seç"}
+                aria-label="Tümünü seç"
+              >
+                {allSelected ? (
+                  <CheckSquare size={12} color="var(--accent)" />
+                ) : someSelected ? (
+                  <CheckSquare size={12} color="var(--accent)" style={{ opacity: 0.5 }} />
+                ) : (
+                  <Square size={12} color="var(--text-2)" />
+                )}
+              </button>
+            </th>
+            <th className="tx-id">txId</th>
+            <th className="tx-kw">keyword1</th>
+            <th className="tx-kw">keyword2</th>
+            {showMsgContent && <th className="tx-msg">msgContent</th>}
+            <th className="tx-conf">Güven</th>
+            <th className="tx-firm-picker">Firma</th>
+            <th className="tx-actions">İşlem</th>
+          </tr>
+        </thead>
+        <tbody>
+          {section.items.map((item) => {
+            const it = itemsById.get(item.transactionId);
+            const isSelected = selected.has(item.transactionId);
+            const isTxOverridden = item.source === "tx-override";
+            const firmOfRow = resolveFirmForTx(
+              item.transactionId,
+              item.row,
+              undefined, // tx reassign zaten uygulandı; bu sadece görsel ipucu
+              { [item.transactionId]: item.effectiveFirm },
+            );
+            return (
+              <tr
+                key={item.transactionId}
+                className={`${isSelected ? "selected" : ""} ${isTxOverridden ? "tx-overridden" : ""} cp-${item.match.confidence}`}
+              >
+                <td className="tx-check">
+                  <button
+                    className="tx-row__check ghost"
+                    onClick={(e) => onToggle(item.transactionId, e)}
+                    title={
+                      isSelected
+                        ? "Seçimi kaldır (Shift+click: range seç, Ctrl+Shift: range kaldır)"
+                        : "Seç (Shift+click: range seç, Ctrl+Shift: range kaldır)"
+                    }
+                    aria-label={isSelected ? "Seçimi kaldır" : "Seç"}
+                  >
+                    {isSelected ? (
+                      <CheckSquare size={11} color="var(--accent)" />
+                    ) : (
+                      <Square size={11} color="var(--text-2)" />
+                    )}
+                  </button>
+                </td>
+                <td className="tx-id" title={`Phone: ${it?.phone ?? "?"}`}>
+                  #{item.transactionId}
+                </td>
+                <td className="tx-kw" title={it?.keyword1 ?? ""}>
+                  {it?.keyword1?.slice(0, 24) ?? "—"}
+                </td>
+                <td className="tx-kw" title={it?.keyword2 ?? ""}>
+                  {it?.keyword2?.slice(0, 24) ?? "—"}
+                </td>
+                {showMsgContent && (
+                  <td className="tx-msg" title={it?.msgContent ?? ""}>
+                    {it?.msgContent?.slice(0, 80) ?? "—"}
+                  </td>
+                )}
+                <td className="tx-conf">
+                  <span className={`pill sm ${item.match.confidence}`}>
+                    {item.match.confidence}
+                  </span>
+                </td>
+                <td className="tx-firm-picker">
+                  <select
+                    value={firmOfRow.accountEuId}
+                    onChange={(e) => onSetTxFirm(item.transactionId, e.target.value)}
+                    title={
+                      isTxOverridden
+                        ? "Bu txId reassign edildi (önceki AI önerisi geçersiz)"
+                        : firmOfRow.accountName ?? ""
+                    }
+                    className={isTxOverridden ? "tx-override" : ""}
+                  >
+                    <option value={CODEC_ACCOUNT_EU_ID}>Codec (fallback)</option>
+                    {customers.map((c) => (
+                      <option key={c.acntEuId} value={c.acntEuId}>
+                        {c.name}
+                      </option>
+                    ))}
+                  </select>
+                </td>
+                <td className="tx-actions">
+                  <button
+                    className="ghost sm"
+                    onClick={() => onCopy(item.transactionId)}
+                    title="txId'i kopyala"
+                  >
+                    <Copy size={10} />
+                  </button>
+                  <button
+                    className="ghost sm"
+                    onClick={() => onRemove(item.transactionId)}
+                    disabled={busy}
+                    title="Bu txId'yi tablodan kaldır (charge etmez)"
+                    aria-label="Kaldır"
+                  >
+                    <X size={10} />
+                  </button>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+
+      <div className="review-firm-section__footer">
+        <span className="muted" style={{ fontSize: 11 }}>
+          {section.selectedCount > 0
+            ? `${section.selectedCount} txId seçili`
+            : "Seçim yok — tek tek checkbox'lardan işaretleyebilirsin"}
+        </span>
+        <div className="footer-actions">
+          <div
+            className="footer-actions__copy"
+            role="group"
+            aria-label="Toplu kopyala"
+          >
+            <span
+              className="footer-actions__label muted"
+              title="Seçili txId'leri farklı formatlarda panoya kopyala"
+            >
+              <Copy size={10} /> Kopyala:
+            </span>
+            {BULK_COPY_FORMATS.map((fmt) => {
+              const sample = formatTxIdsForCopy([1001, 1002], fmt);
+              return (
+                <button
+                  key={fmt}
+                  className="ghost sm"
+                  disabled={busy || section.selectedCount === 0}
+                  onClick={() => {
+                    const ids = section.items
+                      .filter((it) => selected.has(it.transactionId))
+                      .map((it) => it.transactionId);
+                    onBulkCopy(ids, fmt);
+                  }}
+                  title={`Seçili txId'leri ${bulkCopyLabel(fmt)} formatında kopyala — örn. ${sample}`}
+                >
+                  {bulkCopyLabel(fmt)}
+                </button>
+              );
+            })}
+          </div>
+          <button
+            className="primary sm"
+            onClick={() => {
+              const ids = section.items
+                .filter((it) => selected.has(it.transactionId))
+                .map((it) => it.transactionId);
+              onCharge(ids);
+            }}
+            disabled={busy || section.selectedCount === 0}
+            title={`${section.accountName ?? "?"} firmasına tek istekle gönder`}
+          >
+            {busy ? (
+              <Loader2 size={11} className="spin" />
+            ) : (
+              <Zap size={11} />
+            )}
+            Seçili ({section.selectedCount}) Ücretlendir
+          </button>
+        </div>
       </div>
-    </div>
+    </section>
   );
 }
 
-function ActionBar({
-  count,
-  rowCount,
-  format,
-  onFormatChange,
-  onCopy,
-  onCharge,
-  onClear,
+/**
+ * Skeleton placeholder rendered while `buildKeywordRows` is deferred
+ * across RAFs. Visual contract: matches the look of `.review-table`
+ * border/radius so the layout doesn't jump when real rows replace the
+ * bars. Pure presentational — receives only a hint for the human-
+ * readable count (skeleton bars themselves are static, so render cost
+ * is O(1) regardless of `matchesHint`).
+ */
+function ReviewSkeleton({
+  matchesHint,
 }: {
-  count: number;
-  rowCount: number;
-  format: CopyFormat;
-  onFormatChange: (f: CopyFormat) => void;
-  onCopy: () => void;
-  onCharge: () => void;
-  onClear: () => void;
+  matchesHint: number;
 }) {
+  // Static layout — 6 placeholder "section" headers + rows. Skeletons
+  // are CSS-only shimmer bars, no JSX nodes scale with `matchesHint`,
+  // so we intentionally don't enumerate per-row.
+  const sectionCount = 6;
+  const hintText = `Veriler hazırlanıyor (${matchesHint.toLocaleString("tr-TR")} kayıt)…`;
   return (
-    <div className="action-bar">
-      <div className="action-bar__count">
-        <strong>{count}</strong> txId seçili ({rowCount} satır)
+    <>
+      <div
+        className="review-skeleton"
+        role="status"
+        aria-live="polite"
+        aria-label={hintText.replace("…", "")}
+      >
+        {Array.from({ length: sectionCount }).map((_, i) => (
+          <div key={i} style={{ borderBottom: i < sectionCount - 1 ? "1px solid var(--border)" : "none" }}>
+            <div className="review-skeleton__bar review-skeleton__bar--title" />
+            <div className="review-skeleton__bar review-skeleton__bar--row" />
+            <div className="review-skeleton__bar review-skeleton__bar--row is-mid" />
+            <div className="review-skeleton__bar review-skeleton__bar--row is-short" />
+          </div>
+        ))}
       </div>
-      <div className="action-bar__group">
-        <label>Format:</label>
-        <select value={format} onChange={(e) => onFormatChange(e.target.value as CopyFormat)}>
-          <option value="comma">{COPY_FORMAT_LABEL.comma}</option>
-          <option value="newline">{COPY_FORMAT_LABEL.newline}</option>
-          <option value="json">{COPY_FORMAT_LABEL.json}</option>
-          <option value="sql">{COPY_FORMAT_LABEL.sql}</option>
-        </select>
-        <button onClick={onCopy} title="Seçili txId'leri panoya kopyala">
-          <Copy size={11} /> Kopyala
-        </button>
+      <div className="review-skeleton__hint">
+        <span className="spin" aria-hidden="true" />
+        {hintText}
       </div>
-      <div className="action-bar__group">
-        <button className="primary" onClick={onCharge} title="Seçili txId'leri ilgili firmalara gönder">
-          <Zap size={11} /> Ücretlendir
-        </button>
-        <button className="ghost" onClick={onClear} title="Seçimi temizle">
-          <X size={11} /> Temizle
-        </button>
-      </div>
-    </div>
+    </>
   );
 }

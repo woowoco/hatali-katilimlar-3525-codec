@@ -117,6 +117,13 @@ export interface Settings {
   proxyUrl: string;
   model: string;
   throttleMs: number;
+  /**
+   * When true, admin-panel-api calls and /categorize calls are short-
+   * circuited to the in-process mock fixture (`lib/api-mock.ts`,
+   * `lib/ai-mock.ts`). Off by default. Intended for manual UI
+   * verification only — no production workflow should ever enable it.
+   */
+  demoMode: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -124,6 +131,7 @@ export const DEFAULT_SETTINGS: Settings = {
   proxyUrl: "http://localhost:8787",
   model: "MiniMax-M3",
   throttleMs: 200,
+  demoMode: false,
 };
 
 // --- Charge flow ------------------------------------------------------------
