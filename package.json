@@ -1,0 +1,19 @@
+{
+  "name": "hatali-katilimlar-assistant",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI-assisted categorization + review panel for the 3525 short-code unmatched participations workflow.",
+  "workspaces": [
+    "ai-proxy",
+    "extension"
+  ],
+  "scripts": {
+    "dev:proxy": "npm --workspace ai-proxy run dev",
+    "dev:ext": "npm --workspace extension run dev",
+    "build:proxy": "npm --workspace ai-proxy run build",
+    "build:ext": "npm --workspace extension run build",
+    "typecheck": "npm --workspace ai-proxy run typecheck && npm --workspace extension run typecheck",
+    "test": "npm --workspace ai-proxy run test && npm --workspace extension run test && vitest run --config vitest.config.ts",
+    "mock:backend": "tsx ai-proxy/src/mock-server.ts"
+  }
+}

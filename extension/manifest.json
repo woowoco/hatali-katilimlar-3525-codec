@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Hatalı Katılımlar Assistant",
+  "version": "0.1.0",
+  "description": "AI-powered categorization + manual review panel for the 3525 short-code unmatched participations workflow.",
+  "minimum_chrome_version": "114",
+  "action": {
+    "default_title": "Hatalı Katılımlar Assistant"
+  },
+  "background": {
+    "service_worker": "src/background.ts",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://admin-panel.codec.com.tr/*"],
+      "js": ["src/content/discover-session.ts"],
+      "run_at": "document_idle"
+    }
+  ],
+  "permissions": [
+    "storage",
+    "alarms",
+    "cookies",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://admin-panel-api.codec.com.tr/*",
+    "https://admin-panel.codec.com.tr/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ]
+}

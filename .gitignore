@@ -1,0 +1,53 @@
+# Node / build outputs
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+build/
+**/build/
+*.tsbuildinfo
+
+# Env / secrets — **/.env catches root AND nested (e.g. ai-proxy/.env
+# holds a real ANTHROPIC_API_KEY; never commit it).
+**/.env
+**/.env.local
+**/.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Extension build cache
+extension/dist/
+extension/.vite/
+
+# AI proxy build artifacts
+ai-proxy/dist/
+
+# Claude Code — local session state, plans, worktrees, scripts; never
+# lives in the repo (settings.json, commit message drafts, etc.).
+.claude/
+.claude/plans/
+.claude/tmp/
+.claude/worktrees/
+
+# Plan scratch files (defense-in-depth — Claude's plan paths are outside
+# the workspace, but local planning notes sometimes show up next to the
+# repo while drafting).
+PLANS.md
+TODO.local.md
