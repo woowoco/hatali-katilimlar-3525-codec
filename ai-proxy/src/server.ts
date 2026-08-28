@@ -89,6 +89,13 @@ app.get("/models", (_req, res) => {
 //   event: done           data: { model, batches, items, matches, partial?, failedBatches? }
 //   event: error          data: { error }
 //   comment lines (": heartbeat ...") keep the connection warm.
+//
+// Note: `batch-done` ships the FULL matches array (not just a count) so the
+// extension can persist each completed batch incrementally. Previously the
+// payload was `{ i, total, matches: matches.length, accumulated }` and the
+// extension only had access to the matches at the terminal `done` event —
+// so any timeout / error in the middle of the run discarded all earlier
+// batches. See `docs/SAFETY-CONTRACT.md` §3 (operator never loses data).
 app.post("/categorize", async (req: Request, res: Response) => {
   const body = req.body as CategorizeRequest;
   if (!body || !Array.isArray(body.items) || !Array.isArray(body.customers)) {
@@ -182,7 +189,7 @@ app.post("/categorize", async (req: Request, res: Response) => {
           write("batch-done", {
             i,
             total,
-            matches: matches.length,
+            matches,                          // full ItemMatch[] — see header comment
             accumulated: allMatches.length,
           });
         },

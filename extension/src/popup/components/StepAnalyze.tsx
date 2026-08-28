@@ -54,6 +54,13 @@ export function StepAnalyze() {
   const [lastEventAt, setLastEventAt] = useState<number | null>(null);
   const [stallWarning, setStallWarning] = useState(false);
 
+  // Running accumulator for incremental persistence. Each batch-done
+  // appends its (expanded) matches here, and a debounced saveSession
+  // writes the partial result so a mid-run timeout/error never wipes
+  // out already-classified records. See `docs/SAFETY-CONTRACT.md` §3.
+  const runningMatchesRef = useRef<ItemMatch[]>([]);
+  const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   // Local subset editor state. `subset` is the persisted preference
   // (session.subset), `draft` is what the user is currently typing.
   const subset: ItemSubset = session.subset ?? { mode: "all" };
@@ -173,6 +180,43 @@ export function StepAnalyze() {
         expand = (matches) => matches;
       }
 
+      // Incremental persistence: every batch-done appends its expanded
+      // matches to `runningMatchesRef` and triggers a debounced
+      // saveSession. If categorize() later throws mid-run, the partial
+      // matches are already in chrome.storage.local and the operator
+      // can navigate to /review without losing anything.
+      runningMatchesRef.current = [];
+      if (saveDebounceRef.current) {
+        clearTimeout(saveDebounceRef.current);
+        saveDebounceRef.current = null;
+      }
+      const savePartial = async () => {
+        if (saveDebounceRef.current) {
+          clearTimeout(saveDebounceRef.current);
+          saveDebounceRef.current = null;
+        }
+        const matches = runningMatchesRef.current;
+        try {
+          await saveSession({
+            ...session,
+            matches,
+            model: settings.model,
+            lastBatches: progress
+              ? Object.values(progress.batchSummaries).sort((a, b) => a.i - b.i)
+              : [],
+            lastItemsCount: itemsToSend.length,
+          });
+        } catch (err) {
+          console.error("[analyze] incremental saveSession failed:", err);
+        }
+      };
+      const debouncedSave = () => {
+        if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
+        saveDebounceRef.current = setTimeout(() => {
+          savePartial().catch(console.error);
+        }, 250);
+      };
+
       const result = await categorize(
         settings.proxyUrl,
         settings.model,
@@ -189,6 +233,20 @@ export function StepAnalyze() {
             info.batchIndex !== progress?.batchIndex
           ) {
             setBatchStartedAt(Date.now());
+          }
+          // The proxy's batch-done now ships the FULL matches array
+          // (was just a count). Append expanded matches to the running
+          // accumulator and trigger a debounced save so a mid-run
+          // timeout/error doesn't wipe out already-classified records.
+          const latest = info.finishedBatches[info.finishedBatches.length - 1];
+          if (latest !== undefined) {
+            const summary = info.batchSummaries[latest];
+            if (summary?.matchesList && summary.matchesList.length > 0) {
+              const expanded = expand(summary.matchesList);
+              runningMatchesRef.current =
+                runningMatchesRef.current.concat(expanded);
+              debouncedSave();
+            }
           }
         },
         { signal: controller.signal, demoMode: settings.demoMode },
@@ -215,6 +273,10 @@ export function StepAnalyze() {
       const batchList = progress
         ? Object.values(progress.batchSummaries).sort((a, b) => a.i - b.i)
         : [];
+      // The streaming accumulator may have drifted from the canonical
+      // finalMatches if the proxy re-emitted a batch via repair. Sync
+      // the ref to the authoritative result and flush the pending save.
+      runningMatchesRef.current = finalMatches;
       const next: SessionState = {
         ...session,
         matches: finalMatches,
@@ -224,12 +286,30 @@ export function StepAnalyze() {
       };
       await saveSession(next);
       setSession(next);
-      toast.push(
-        `${finalMatches.length} eşleşme bulundu (${result.batches} batch${
-          clusteringOn ? `, clustering açık: ${llmItems.length} temsilci` : ""
-        })`,
-        "success",
-      );
+      if (saveDebounceRef.current) {
+        clearTimeout(saveDebounceRef.current);
+        saveDebounceRef.current = null;
+      }
+      if (result.partial) {
+        // Partial recovery: the run didn't reach `done`, but the proxy
+        // salvaged whatever batches completed. We still navigate to
+        // /review so the operator can act on the matches we have; the
+        // failedBatches list surfaces what they didn't get.
+        const failed = result.failedBatches?.length ?? 0;
+        toast.push(
+          `Kısmi sonuç: ${finalMatches.length} eşleşme alındı${
+            failed > 0 ? `, ${failed} batch başarısız oldu` : ""
+          }. Devam edebilirsin.`,
+          "info",
+        );
+      } else {
+        toast.push(
+          `${finalMatches.length} eşleşme bulundu (${result.batches} batch${
+            clusteringOn ? `, clustering açık: ${llmItems.length} temsilci` : ""
+          })`,
+          "success",
+        );
+      }
       navigate("/review");
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

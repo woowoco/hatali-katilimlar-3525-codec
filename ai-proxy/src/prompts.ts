@@ -47,8 +47,8 @@ export function buildSystemPrompt(): string {
     "Context:",
     "- Subscribers send SMS messages to short code 3525 with two keyword fields (keyword1, keyword2) plus optional body text (msgContent).",
     "- The system already matched most messages to a paying customer (firm). The ones that DID NOT match are listed below — they need to be charged manually to the correct firm.",
-    "- You will be given the full customer list with names. Each 'firm' has an account id (acntEuId).",
-    "- If NO customer in the list is a good match for a transaction, leave suggestedAccountEuId as null. The UI will list those under 'Codec'e ücretlendir' so a human can charge them manually to the system Codec account.",
+    "- You will be given the full customer list as numbered entries (1., 2., 3., …). Each entry has a firm name; the index number is the identifier you emit as `suggestedAccountEuId`. The proxy will translate the index back to the real account id before charging, so you MUST use the integer index from the list — do NOT invent or repeat UUIDs.",
+    "- If NO customer in the list is a good match for a transaction, set `suggestedAccountEuId` to JSON null (not the string \"null\", not 0). The UI will list those under 'Codec'e ücretlendir' so a human can charge them manually to the system Codec account.",
     "- READ-ONLY: you are only classifying transactions. You must NEVER trigger charging, NEVER suggest bulk auto-charges, NEVER decide that any group should be auto-billed. The human operator opens each row manually and clicks 'Tümünü ücretlendir' or 'Seçili' to charge — your job ends at producing the keyword-table suggestions.",
     "",
     "Your task — for EACH item, emit exactly ONE annotation:",
@@ -84,7 +84,7 @@ export function buildSystemPrompt(): string {
     "Strict rules:",
     "- Cover EVERY input item exactly once. Missing items = a hard error.",
     "- DO NOT invent transactionIds — only echo ones from the input list.",
-    "- DO NOT invent accountEuIds — only use ones from the customer list (or null).",
+    "- DO NOT invent accountEuIds. Emit the INTEGER INDEX from the customer list above (1-based) as `suggestedAccountEuId`. Never invent UUIDs — the proxy translates your integer back to the real account id, and only valid indices are accepted.",
     "- keywordGroup must be ASCII kebab-case (a-z, 0-9, '-'). NO Turkish characters, NO spaces.",
     "- Be conservative with 'high' confidence. An operator must agree.",
     "- For garbage/system messages (e.g. keyword1 = '.', random punctuation), still emit a record but use keywordGroup='unknown' and suggestedAccountEuId=null.",
@@ -99,8 +99,14 @@ export function buildUserPrompt(
   items: UnmatchedItem[],
   overrides: KeywordOverride[] = [],
 ): string {
+  // Customer lines use 1-based integer indices instead of the 36-char
+  // UUID. The LLM echoes the index as `suggestedAccountEuId`; the proxy
+  // translates it back to the real UUID via `withResolvedCustomerIds`
+  // before returning the match to the extension. Saves ~13 tokens per
+  // customer per call — at 627 customers × 15 batches that's ~120k
+  // input tokens per run.
   const customerLines = customers.map(
-    (c, i) => `${i + 1}. acntEuId=${c.acntEuId} | name=${c.name}`,
+    (c, i) => `${i + 1}. name=${c.name}`,
   );
 
   const itemLines = items.map(
@@ -109,7 +115,7 @@ export function buildUserPrompt(
   );
 
   const sections: string[] = [
-    `=== CUSTOMERS (${customers.length}) ===`,
+    `=== CUSTOMERS (${customers.length}) — emit the index number (1..${customers.length}) as suggestedAccountEuId ===`,
     customerLines.join("\n"),
     "",
   ];
@@ -259,9 +265,9 @@ export const ITEM_ANNOTATIONS_TOOL = {
                 "ASCII kebab-case cluster name. Same intent = same name across the whole batch.",
             },
             suggestedAccountEuId: {
-              type: ["string", "null"],
+              type: ["integer", "null"],
               description:
-                "Best-matching acntEuId (UUID string), or JSON null if no customer in the list is a good fit. MUST be JSON null — not the 4-character string \"null\".",
+                "Best-matching customer's INDEX from the customer list above (1-based, integer). The proxy translates this back to the real account id before charging. JSON null if no customer fits — not 0 and not the string \"null\".",
             },
             suggestedAccountName: {
               type: "string",
@@ -297,62 +303,147 @@ const VALID_MATCH_FIELDS: ReadonlySet<MatchField> = new Set([
 ]);
 
 /**
- * Validate the LLM's tool-call payload against the input items.
- * Returns cleaned matches; throws if a transactionId is missing/unknown.
- * Also auto-promotes 'no firm' cases to the Codec fallback so the UI can render
- * them under "Codec'e ücretlendir".
+ * Result of validating the LLM's tool-call payload against the input items.
+ *
+ * The function is intentionally PARTIAL-tolerant (since 2026-08-28) — one
+ * malformed row no longer nukes the whole batch. The previous all-or-nothing
+ * behaviour silently discarded 50 records when a single non-integer txId
+ * arrived, which the operator flagged as a top complaint. The caller decides
+ * what to do with `missing` and `invalid` — `runOneBatch` issues a cheap
+ * repair call for ≤5 missing items and synthesises Codec-fallback
+ * placeholders for >5 (so the operator still sees the records).
+ */
+export interface ValidateResult {
+  /** Successfully normalised matches, one per input transactionId. */
+  cleaned: ItemMatch[];
+  /** Input transactionIds that the LLM did not cover (length 0..items.length). */
+  missing: number[];
+  /** Raw records dropped for non-integer / unknown / duplicate transactionId. */
+  invalid: unknown[];
+}
+
+/**
+ * Validate the LLM's tool-call payload against the input items. Returns
+ * `{cleaned, missing, invalid}`; never throws on a single bad row.
+ *
+ * - For each input record, drop into `invalid[]` on non-integer / unknown /
+ *   duplicate txId (logged to console.warn so the operator can see the drop).
+ * - After the loop, `missing` is the set of input txIds absent from `cleaned`.
+ * - Auto-promotes 'no firm' cases (`suggestedAccountEuId === null`) so the
+ *   UI renders them under "Codec'e ücretlendir".
  */
 export function validateMatches(
-  raw: ItemMatch[],
+  raw: readonly unknown[],
   items: UnmatchedItem[],
-): ItemMatch[] {
+  customers: Customer[] = [],
+): ValidateResult {
   const itemIds = new Set(items.map((i) => i.transactionId));
   const seen = new Set<number>();
   const cleaned: ItemMatch[] = [];
+  const invalid: unknown[] = [];
 
-  for (const m of raw) {
-    if (!Number.isInteger(m.transactionId)) {
-      throw new Error(`match has non-integer transactionId`);
-    }
-    if (!itemIds.has(m.transactionId)) {
-      throw new Error(
-        `match references unknown transactionId ${m.transactionId}`,
-      );
-    }
-    if (seen.has(m.transactionId)) {
-      throw new Error(
-        `transactionId ${m.transactionId} appears in multiple matches`,
-      );
-    }
-    seen.add(m.transactionId);
+  for (const candidate of raw) {
+    const m = candidate as Partial<ItemMatch>;
+    const tx = m?.transactionId;
 
-    const matchedField: MatchField = VALID_MATCH_FIELDS.has(m.matchedField)
-      ? m.matchedField
+    if (!Number.isInteger(tx)) {
+      console.warn(
+        `[validateMatches] dropping match with non-integer transactionId (${JSON.stringify(tx)})`,
+      );
+      invalid.push(candidate);
+      continue;
+    }
+    if (!itemIds.has(tx as number)) {
+      console.warn(
+        `[validateMatches] dropping match referencing unknown transactionId ${tx}`,
+      );
+      invalid.push(candidate);
+      continue;
+    }
+    if (seen.has(tx as number)) {
+      console.warn(
+        `[validateMatches] dropping duplicate match for transactionId ${tx}`,
+      );
+      invalid.push(candidate);
+      continue;
+    }
+    seen.add(tx as number);
+
+    const matchedField: MatchField = VALID_MATCH_FIELDS.has(m.matchedField as MatchField)
+      ? (m.matchedField as MatchField)
       : "keyword1";
 
+    // The LLM emits the integer INDEX from the customer list (1-based),
+    // not a UUID. Resolve it back to the real account id here so the
+    // extension sees the wire shape (`string | null`) it expects.
+    const resolvedEuId = resolveCustomerIndexToEuId(
+      m.suggestedAccountEuId,
+      customers,
+    );
+
     cleaned.push({
-      transactionId: m.transactionId,
+      transactionId: tx as number,
       matchedField,
       matchedValue: m.matchedValue ?? "",
       keywordGroup: normalizeGroup(m.keywordGroup),
-      suggestedAccountEuId: sanitizeAccountEuId(m.suggestedAccountEuId),
+      suggestedAccountEuId: resolvedEuId,
       suggestedAccountName: sanitizeAccountName(m.suggestedAccountName),
       confidence: m.confidence ?? "low",
       reasoning: m.reasoning ?? "",
     });
   }
 
-  const missing = items.filter((i) => !seen.has(i.transactionId));
+  const missing = items
+    .filter((i) => !seen.has(i.transactionId))
+    .map((i) => i.transactionId);
+
   if (missing.length > 0) {
-    throw new Error(
-      `${missing.length} transactionIds were not covered by any match (e.g. ${missing
-        .slice(0, 5)
-        .map((m) => m.transactionId)
-        .join(", ")})`,
+    console.warn(
+      `[validateMatches] ${missing.length} transactionIds were not covered ` +
+        `(e.g. ${missing.slice(0, 5).join(", ")})`,
     );
   }
 
-  return cleaned;
+  return { cleaned, missing, invalid };
+}
+
+/**
+ * Translate the LLM's integer customer index back to the real UUID.
+ * Tolerates literal-string `"null"`, whitespace strings, and out-of-
+ * range / non-integer values — anything we can't translate becomes
+ * null, which lands the record in the Codec fallback bucket in the
+ * extension (per `docs/SAFETY-CONTRACT.md`).
+ */
+function resolveCustomerIndexToEuId(
+  raw: unknown,
+  customers: Customer[],
+): string | null {
+  if (raw == null) return null;
+  if (typeof raw === "number") {
+    if (!Number.isInteger(raw)) return null;
+    return lookupCustomer(raw, customers);
+  }
+  if (typeof raw === "string") {
+    // Reuse the existing schema-tolerance helper to coerce literal
+    // "null" / whitespace / empty strings — anything left after that is
+    // either a bare numeric index ("3") or garbage. Garbage → null.
+    const cleaned = sanitizeAccountEuId(raw);
+    if (cleaned == null) return null;
+    const n = Number(cleaned);
+    if (!Number.isInteger(n)) return null;
+    return lookupCustomer(n, customers);
+  }
+  return null;
+}
+
+function lookupCustomer(idx: number, customers: Customer[]): string | null {
+  if (idx < 1 || idx > customers.length) {
+    console.warn(
+      `[validateMatches] dropping customer index ${idx} (out of range 1..${customers.length}); routing to Codec`,
+    );
+    return null;
+  }
+  return customers[idx - 1].acntEuId ?? null;
 }
 
 function normalizeGroup(g: string | undefined): string {

@@ -59,6 +59,12 @@ describe("buildSystemPrompt / buildUserPrompt", () => {
 
 describe("validateMatches", () => {
   const items = [makeItem(1, "IPTAL"), makeItem(2, "ODEME"), makeItem(3)];
+  // Two-firm customer list used by the int-ref roundtrip tests below.
+  const customers = [
+    { name: "Aktif Bank", acntEuId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" },
+    { name: "Garanti",   acntEuId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb" },
+    { name: "Codec",     acntEuId: "00000000-0000-0000-0000-000000000000" },
+  ];
 
   it("accepts a clean response covering every item", () => {
     const raw: ItemMatch[] = [
@@ -93,12 +99,90 @@ describe("validateMatches", () => {
         reasoning: "garbage",
       },
     ];
-    const cleaned = validateMatches(raw, items);
+    const { cleaned } = validateMatches(raw, items);
     expect(cleaned).toHaveLength(3);
     expect(cleaned[2].suggestedAccountEuId).toBeNull();
   });
 
-  it("throws if an input item is not covered", () => {
+  it("translates integer customer indices back to real UUIDs", () => {
+    const raw = [
+      {
+        transactionId: 1,
+        matchedField: "keyword1",
+        matchedValue: "IPTAL",
+        keywordGroup: "iptal",
+        suggestedAccountEuId: 1,            // → customers[0].acntEuId
+        suggestedAccountName: "Aktif Bank",
+        confidence: "high",
+        reasoning: "",
+      },
+      {
+        transactionId: 2,
+        matchedField: "keyword1",
+        matchedValue: "ODEME",
+        keywordGroup: "odeme",
+        suggestedAccountEuId: 2,            // → customers[1].acntEuId
+        suggestedAccountName: "Garanti",
+        confidence: "high",
+        reasoning: "",
+      },
+      {
+        transactionId: 3,
+        matchedField: "keyword1",
+        matchedValue: ".",
+        keywordGroup: "unknown",
+        suggestedAccountEuId: null,         // → Codec
+        suggestedAccountName: null,
+        confidence: "low",
+        reasoning: "",
+      },
+    ];
+    const { cleaned } = validateMatches(raw, items, customers);
+    expect(cleaned[0].suggestedAccountEuId).toBe("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+    expect(cleaned[1].suggestedAccountEuId).toBe("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+    expect(cleaned[2].suggestedAccountEuId).toBeNull();
+  });
+
+  it("routes out-of-range integer indices to Codec", () => {
+    const raw = [
+      {
+        transactionId: 1,
+        matchedField: "keyword1",
+        matchedValue: "X",
+        keywordGroup: "x",
+        suggestedAccountEuId: 99,           // out of range
+        suggestedAccountName: null,
+        confidence: "low",
+        reasoning: "",
+      },
+      {
+        transactionId: 2,
+        matchedField: "keyword1",
+        matchedValue: "Y",
+        keywordGroup: "y",
+        suggestedAccountEuId: 0,            // 0 is not a valid 1-based index
+        suggestedAccountName: null,
+        confidence: "low",
+        reasoning: "",
+      },
+      {
+        transactionId: 3,
+        matchedField: "keyword1",
+        matchedValue: "Z",
+        keywordGroup: "z",
+        suggestedAccountEuId: "2",          // numeric string is tolerated
+        suggestedAccountName: null,
+        confidence: "low",
+        reasoning: "",
+      },
+    ];
+    const { cleaned } = validateMatches(raw, items, customers);
+    expect(cleaned[0].suggestedAccountEuId).toBeNull();
+    expect(cleaned[1].suggestedAccountEuId).toBeNull();
+    expect(cleaned[2].suggestedAccountEuId).toBe("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+  });
+
+  it("returns missing txIds instead of throwing when coverage is incomplete", () => {
     const raw: ItemMatch[] = [
       {
         transactionId: 1,
@@ -111,10 +195,14 @@ describe("validateMatches", () => {
         reasoning: "",
       },
     ];
-    expect(() => validateMatches(raw, items)).toThrow(/not covered/i);
+    const result = validateMatches(raw, items);
+    expect(result.cleaned).toHaveLength(1);
+    expect(result.cleaned[0].transactionId).toBe(1);
+    expect(result.missing).toEqual([2, 3]);
+    expect(result.invalid).toEqual([]);
   });
 
-  it("throws on unknown transactionId", () => {
+  it("isolates unknown transactionId into invalid[] instead of throwing", () => {
     const raw: ItemMatch[] = [
       {
         transactionId: 999,
@@ -127,10 +215,16 @@ describe("validateMatches", () => {
         reasoning: "",
       },
     ];
-    expect(() => validateMatches(raw, items)).toThrow(/unknown transactionId 999/i);
+    const result = validateMatches(raw, items);
+    expect(result.cleaned).toEqual([]);
+    expect(result.invalid).toHaveLength(1);
+    expect((result.invalid[0] as ItemMatch).transactionId).toBe(999);
+    // Real items 1, 2, 3 are still missing — that surfaces via the
+    // repair/synthesis path, not as a thrown error.
+    expect(result.missing).toEqual([1, 2, 3]);
   });
 
-  it("throws on duplicate transactionId", () => {
+  it("keeps the first occurrence of a duplicate txId and isolates the rest", () => {
     const raw: ItemMatch[] = [
       {
         transactionId: 1,
@@ -153,7 +247,12 @@ describe("validateMatches", () => {
         reasoning: "",
       },
     ];
-    expect(() => validateMatches(raw, items)).toThrow(/multiple matches/i);
+    const result = validateMatches(raw, items);
+    expect(result.cleaned).toHaveLength(1);
+    expect(result.cleaned[0].matchedField).toBe("keyword1");
+    expect(result.invalid).toHaveLength(1);
+    expect((result.invalid[0] as ItemMatch).matchedField).toBe("keyword2");
+    expect(result.missing).toEqual([2, 3]);
   });
 
   it("normalizes Turkish characters in keywordGroup to ASCII kebab-case", () => {
@@ -189,7 +288,7 @@ describe("validateMatches", () => {
         reasoning: "",
       },
     ];
-    const cleaned = validateMatches(raw, items);
+    const { cleaned } = validateMatches(raw, items);
     expect(cleaned[0].keywordGroup).toBe("iptal-iptali");
     expect(cleaned[1].keywordGroup).toBe("odeme-geri-alma");
     expect(cleaned[2].keywordGroup).toBe("unknown");
@@ -231,7 +330,7 @@ describe("validateMatches", () => {
         reasoning: "",
       },
     );
-    const cleaned = validateMatches(raw, items);
+    const { cleaned } = validateMatches(raw, items);
     expect(cleaned[0].matchedField).toBe("keyword1");
   });
 
@@ -279,7 +378,7 @@ describe("validateMatches", () => {
         reasoning: "",
       },
     ];
-    const cleaned = validateMatches(raw, items);
+    const { cleaned } = validateMatches(raw, items);
     expect(cleaned[0].suggestedAccountEuId).toBeNull();
   });
 
@@ -316,7 +415,7 @@ describe("validateMatches", () => {
         reasoning: "",
       },
     ];
-    const cleaned = validateMatches(raw, items);
+    const { cleaned } = validateMatches(raw, items);
     expect(cleaned[0].suggestedAccountEuId).toBeNull();
     expect(cleaned[1].suggestedAccountEuId).toBeNull();
   });
@@ -354,7 +453,7 @@ describe("validateMatches", () => {
         reasoning: "",
       },
     ];
-    const cleaned = validateMatches(raw, items);
+    const { cleaned } = validateMatches(raw, items);
     expect(cleaned[0].suggestedAccountName).toBeNull();
   });
 });

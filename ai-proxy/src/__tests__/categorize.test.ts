@@ -200,6 +200,101 @@ describe("categorize", () => {
     expect(result.failedBatches![0].error).toMatch(/tool_use block/);
   });
 
+  it("issues a warm-up call (batch 0 alone) before fanning out the rest", async () => {
+    // 250 items → 5 batches. We expect:
+    //   - call 1 = batch 0 (warm-up, runs sequentially before any worker)
+    //   - calls 2..5 = batches 1..4 (fan-out via the worker pool)
+    // The fan-out ordering across the pool is non-deterministic, but
+    // call #1 must always be the warm-up because the worker counter
+    // starts at poolStart=1.
+    const big = Array.from({ length: 250 }, (_, i) => ({
+      ...items[i % items.length],
+      transactionId: 1000 + i,
+    }));
+    const responses = [];
+    for (let i = 0; i < 250; i += 50) {
+      responses.push(responseFor(big.slice(i, i + 50)));
+    }
+    const client = makeFakeClient({ responses });
+    // Capture the transactionIds each call sees — the warm-up call must
+    // see txIds from the first 50-item slice only.
+    const seenTxIdsPerCall: number[][] = [];
+    const originalCreate = client.messages.create;
+    client.messages.create = vi.fn(async (req: unknown, _opts?: unknown) => {
+      const r = req as { messages: Array<{ content: Array<{ text: string }> }> };
+      const text = r.messages[0].content
+        .map((b) => ("text" in b ? b.text : ""))
+        .join("\n");
+      const txIds = [...text.matchAll(/tx=(\d+)/g)].map((m) => Number(m[1]));
+      seenTxIdsPerCall.push(txIds);
+      return originalCreate(req);
+    });
+
+    const dones: number[] = [];
+    const result = await categorize(
+      client as never,
+      { items: big, customers: [customer] },
+      {
+        onBatchDone: (i) => dones.push(i),
+      },
+    );
+    expect(result.batches).toBe(5);
+    expect(result.matches).toHaveLength(250);
+    expect(seenTxIdsPerCall).toHaveLength(5);
+    // First call = warm-up = batch 0 items (txIds 1000..1049).
+    expect(seenTxIdsPerCall[0]).toEqual(big.slice(0, 50).map((i) => i.transactionId));
+    // Subsequent calls must NOT include any txId from batch 0 (cache-
+    // priming is per-batch; the warm-up pass is dedicated to batch 0).
+    for (let k = 1; k < seenTxIdsPerCall.length; k++) {
+      const batch0Ids = new Set(big.slice(0, 50).map((i) => i.transactionId));
+      const overlap = seenTxIdsPerCall[k].filter((id) => batch0Ids.has(id));
+      expect(overlap).toEqual([]);
+    }
+    // onBatchDone for batch 0 fires before any other batch finishes —
+    // the warm-up is sequential, the fan-out is parallel.
+    expect(dones[0]).toBe(0);
+  });
+
+  it("skips the warm-up when there is only one batch", async () => {
+    // Single-batch runs have nothing to share the cached prefix with,
+    // so we go straight to the worker pool. The worker counter starts
+    // at poolStart=0 and the run completes in one call.
+    const client = makeFakeClient({ responses: [responseFor(items)] });
+    await categorize(client as never, { items, customers: [customer] });
+    // Exactly one create call: the single batch.
+    expect(client.messages.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("records the warm-up batch as failed when it errors but fans out anyway", async () => {
+    // 250 items → 5 batches. Warm-up call (batch 0) fails with 400
+    // (non-retryable). The remaining 4 batches should still run via
+    // the fan-out and surface batch 0 as a failedBatch entry.
+    const big = Array.from({ length: 250 }, (_, i) => ({
+      ...items[i % items.length],
+      transactionId: 1000 + i,
+    }));
+    const responses = [];
+    for (let i = 50; i < 250; i += 50) {
+      responses.push(responseFor(big.slice(i, i + 50)));
+    }
+    const client = makeFakeClient({
+      responses,
+      failWith: [{ status: 400, message: "bad request" }],
+    });
+    const result = await categorize(client as never, {
+      items: big,
+      customers: [customer],
+    });
+    expect(result.partial).toBe(true);
+    expect(result.failedBatches).toBeDefined();
+    // Batch 0 surfaces in failedBatches, fan-out succeeded for 1..4.
+    const failedIndexes = result.failedBatches!.map((f) => f.batchIndex);
+    expect(failedIndexes).toContain(0);
+    // Slots 1..4 populated; slot 0 left as undefined (sparse array).
+    expect(result.matches.filter((m) => m !== undefined)).toHaveLength(200);
+    expect(result.matches[0]).toBeUndefined();
+  });
+
   it("emits progress callbacks per batch", async () => {
     const client = makeFakeClient({
       responses: [responseFor(items), responseFor([])],

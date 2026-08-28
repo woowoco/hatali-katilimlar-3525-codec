@@ -94,7 +94,13 @@ export async function categorize(
       accumulatedMatches: DEMO_CATEGORIZE_RESPONSE.matches.length,
       currentBatchSize: items.length,
       batchSummaries: {
-        0: { i: 0, size: items.length, matches: DEMO_CATEGORIZE_RESPONSE.matches.length, accumulated: DEMO_CATEGORIZE_RESPONSE.matches.length },
+        0: {
+          i: 0,
+          size: items.length,
+          matches: DEMO_CATEGORIZE_RESPONSE.matches.length,
+          accumulated: DEMO_CATEGORIZE_RESPONSE.matches.length,
+          matchesList: DEMO_CATEGORIZE_RESPONSE.matches,
+        },
       },
       finishedBatches: [0],
       timedOutBatches: [],
@@ -143,6 +149,11 @@ export async function categorize(
     currentTimeoutMs: 90_000,
     consecutiveTimeouts: 0,
   };
+  // Running accumulator of every match produced by every completed batch
+  // so far. Used to synthesise a partial result on error / stall / abort.
+  // The proxy's `batch-done` event now carries the full matches array
+  // (was just a count), so we can persist incrementally in /analyze.
+  let accumulatedMatches: ItemMatch[] = [];
   let donePayload: CategorizeResponse | null = null;
   let errorMessage: string | null = null;
 
@@ -173,7 +184,17 @@ export async function categorize(
         } else if (parsed.event === "batch-done") {
           const idx = data.i as number;
           const totalBatches = data.total as number;
-          const batchMatches = data.matches as number;
+          // Since 2026-08-28 the proxy ships the FULL matches array in
+          // batch-done (it used to be just a count). Older proxies may
+          // still send a number; we tolerate either shape.
+          const rawMatches = data.matches as unknown;
+          const batchMatchesList: ItemMatch[] = Array.isArray(rawMatches)
+            ? (rawMatches as ItemMatch[])
+            : [];
+          const batchMatchesCount =
+            typeof rawMatches === "number"
+              ? rawMatches
+              : batchMatchesList.length;
           const accumulated = data.accumulated as number;
           // The proxy doesn't echo the batch size in batch-done, but the
           // matching batch-start did, so derive size from there.
@@ -186,12 +207,23 @@ export async function categorize(
             accumulatedMatches: accumulated,
             batchSummaries: {
               ...info.batchSummaries,
-              [idx]: { i: idx, size, matches: batchMatches, accumulated },
+              [idx]: {
+                i: idx,
+                size,
+                matches: batchMatchesCount,
+                accumulated,
+                matchesList: batchMatchesList,
+              },
             },
             finishedBatches: info.finishedBatches.includes(idx)
               ? info.finishedBatches
               : [...info.finishedBatches, idx],
           };
+          // Append this batch's matches to our running accumulator so
+          // we can synthesise a partial donePayload on a mid-run abort.
+          if (batchMatchesList.length > 0) {
+            accumulatedMatches = accumulatedMatches.concat(batchMatchesList);
+          }
           onProgress?.(info);
         } else if (parsed.event === "batch-timeout") {
           const idx = data.i as number;
@@ -251,11 +283,34 @@ export async function categorize(
     if (abortHandler) opts.signal?.removeEventListener("abort", abortHandler);
   }
 
-  if (errorMessage) throw new Error(errorMessage);
-  if (!donePayload) {
-    throw new Error("proxy /categorize: stream ended without 'done' event");
-  }
-  return donePayload;
+  // Mid-run recovery: the run didn't reach a `done` event, but if we have
+// any matches accumulated already we MUST surface them so the operator
+// doesn't lose work to a later timeout / error / abort. Salvage the
+// partial result into a synthesised CategorizeResponse; only throw when
+// there's nothing at all to return.
+if (!donePayload && accumulatedMatches.length > 0) {
+  donePayload = {
+    model,
+    batches: info.batchesTotal ?? 0,
+    items: accumulatedMatches.length,
+    matches: accumulatedMatches,
+    partial: true,
+    failedBatches: [
+      {
+        batchIndex: -1,
+        error:
+          errorMessage ?? "proxy /categorize: stream ended without 'done' event",
+      },
+    ],
+  };
+}
+if (errorMessage && !donePayload) {
+  throw new Error(errorMessage);
+}
+if (!donePayload) {
+  throw new Error("proxy /categorize: stream ended without 'done' event");
+}
+return donePayload;
 }
 
 function sleep(ms: number): Promise<void> {

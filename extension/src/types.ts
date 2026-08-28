@@ -56,6 +56,14 @@ export interface CategorizeBatchSummary {
   matches: number;
   /** Cumulative match count after this batch completed. */
   accumulated: number;
+  /**
+   * Full ItemMatch[] produced by THIS batch. Populated since 2026-08-28
+   * so the extension can persist each completed batch into the session
+   * incrementally (per `docs/SAFETY-CONTRACT.md` §3 — the operator
+   * never loses matched data on a mid-run timeout/error). Optional
+   * for back-compat with older proxy versions that ship only a count.
+   */
+  matchesList?: ItemMatch[];
 }
 
 export interface ModelInfo {

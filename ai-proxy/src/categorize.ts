@@ -186,15 +186,78 @@ export async function categorize(
   // partial response — a path we don't currently take but stay defensive).
   const workerErrorsByBatch = new Map<number, string>();
 
+  // Warm-up pass: MiniMax's automatic prefix cache needs at least one
+  // call to hash and prime the static prefix (system prompt + customer
+  // list + tool schema — ~6.5k tokens). Running batch 0 alone before
+  // fanning the rest out means the 15 follow-up calls hit a warm cache
+  // instead of all 16 paying the full prefix cost. Single-batch runs
+  // skip this entirely — nothing to share the cached prefix with.
+  const warmupEnabled = totalBatches > 1;
+  const poolStart = warmupEnabled ? 1 : 0;
+  if (warmupEnabled) {
+    const batch0 = batches[0];
+    progress.onBatchStart?.(0, totalBatches, batch0.length);
+    try {
+      const matches = await runOneBatch(
+        client,
+        model,
+        batch0,
+        req.customers,
+        progress.signal,
+        0,
+        req.overrides ?? [],
+        adaptive,
+        progress.maxRetriesOverride ?? MAX_RETRIES,
+      );
+      adaptive.recordSuccess();
+      // Slot 0 of allMatches starts at offset 0; the worker pool starts
+      // at poolStart, so there is no overlap risk.
+      for (let j = 0; j < matches.length; j++) {
+        allMatches[j] = matches[j];
+      }
+      progress.onBatchDone?.(0, totalBatches, matches);
+      batchesDone++;
+      const elapsed = Math.round((Date.now() - runStartedAt) / 1000);
+      console.log(
+        `[categorize] batch 1/${totalBatches} done (warm-up) · ${matches.length} matches · ${elapsed}s elapsed`,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      workerErrorsByBatch.set(0, msg);
+      if (msg.includes("timed out")) {
+        batchesTimedOut++;
+        adaptive.recordTimeout();
+        const consecutiveTimeouts = batchesTimedOut;
+        progress.onBatchTimeout?.(0, totalBatches, adaptive.ms, consecutiveTimeouts);
+        const elapsed = Math.round((Date.now() - runStartedAt) / 1000);
+        console.warn(
+          `[categorize] batch 1/${totalBatches} TIMEOUT on warm-up · ${elapsed}s elapsed · next timeout=${Math.round(adaptive.ms / 1000)}s`,
+        );
+      } else {
+        const elapsed = Math.round((Date.now() - runStartedAt) / 1000);
+        console.error(
+          `[categorize] batch 1/${totalBatches} failed on warm-up · ${elapsed}s elapsed: ${msg}`,
+        );
+      }
+      // Continue anyway — a failed warm-up doesn't poison the remaining
+      // batches. The partial flag will surface this to the operator
+      // through failedBatches[batchIndex=0].
+    }
+  }
+
   const worker = async (workerId: number) => {
     while (true) {
       if (progress.signal?.aborted) {
         throw new DOMException("aborted", "AbortError");
       }
       if (adaptive.isBudgetExceeded()) {
-        throw new Error(
-          `categorize global budget exceeded (${Math.round(GLOBAL_BUDGET_MS / 1000)}s)`,
-        );
+        // Budget exceeded mid-run: stop claiming new batches. We do NOT
+        // throw — the post-allSettled sweep below records each unclaimed
+        // batch as a failedBatch entry so the operator sees them instead
+        // of silently dropping them. (Previously this threw and
+        // Promise.allSettled swallowed it; `next < totalBatches` batches
+        // were unaccounted for in failedBatches.)
+        return;
       }
       const i = next++;
       if (i >= totalBatches) return;
@@ -258,12 +321,29 @@ export async function categorize(
     }
   };
 
-  const workerCount = Math.min(CONCURRENCY, totalBatches);
+  const workerCount = Math.min(CONCURRENCY, totalBatches - poolStart);
+  // The first `poolStart` batches are already running (or done) — start
+  // the worker counter from there so the fan-out picks up after them.
+  next = poolStart;
   // allSettled: a single worker throwing (e.g. abort signal) won't lose
   // the work the other workers already produced. We aggregate below.
   await Promise.allSettled(
     Array.from({ length: workerCount }, (_, k) => worker(k + 1)),
   );
+
+  // Sweep: any batch indices that workers never reached (next < totalBatches)
+  // are recorded as failed. This is the bug surface that used to silently
+  // drop unclaimed batches when the global budget tripped mid-run.
+  if (next < totalBatches) {
+    for (let k = next; k < totalBatches; k++) {
+      if (!workerErrorsByBatch.has(k)) {
+        workerErrorsByBatch.set(
+          k,
+          `categorize global budget exceeded (unclaimed batch ${k + 1}/${totalBatches})`,
+        );
+      }
+    }
+  }
 
   // If the abort signal fired, propagate that — the caller asked us to stop.
   if (progress.signal?.aborted) {
@@ -426,7 +506,60 @@ async function runOneBatch(
           );
         }
 
-        return validateMatches(input.matches, items);
+        // validateMatches is partial-tolerant: returns {cleaned, missing, invalid}.
+        // We repair small gaps with a cheap follow-up call (prefix cache is warm)
+        // and synthesise Codec-fallback placeholders for anything still missing,
+        // so the operator never silently loses records.
+        // validateMatches is partial-tolerant: returns {cleaned, missing, invalid}.
+        // We repair small gaps with a cheap follow-up call (prefix cache is warm)
+        // and synthesise Codec-fallback placeholders for anything still missing,
+        // so the operator never silently loses records.
+        const result = validateMatches(input.matches, items, customers);
+        const cleaned: ItemMatch[] = [...result.cleaned];
+        const covered = new Set(cleaned.map((m) => m.transactionId));
+
+        if (result.missing.length > 0 && result.missing.length <= 5) {
+          // Cheap repair: re-issue just the missing items. The customer
+          // list + system prompt + tool schema are now cached on the API
+          // side, so this is a fraction of the original call's price.
+          // maxRetries=1 — one fresh attempt; if it fails too, we fall
+          // through to synthesis below.
+          console.log(
+            `[runOneBatch] repair pass for ${result.missing.length} missing ` +
+              `txIds (e.g. ${result.missing.slice(0, 5).join(", ")})`,
+          );
+          const missingSet = new Set(result.missing);
+          const repairItems = items.filter((i) => missingSet.has(i.transactionId));
+          try {
+            const repaired = await runOneBatch(
+              client, model, repairItems, customers,
+              signal, depth + 1, overrides, adaptive, 1,
+            );
+            for (const m of repaired) {
+              if (!covered.has(m.transactionId)) {
+                cleaned.push(m);
+                covered.add(m.transactionId);
+              }
+            }
+          } catch (err) {
+            console.warn(
+              `[runOneBatch] repair pass failed (${err instanceof Error ? err.message : String(err)}) — falling back to synthesis`,
+            );
+          }
+        }
+
+        // Synthesise Codec-fallback placeholders for anything still
+        // uncovered. These land in the __codec_fallback__ row in /review
+        // (suggestedAccountEuId === null), with a `synthetic: …` reasoning
+        // prefix the UI uses for the "Y kayıt AI kapsamadı" subtitle.
+        for (const txId of result.missing) {
+          if (!covered.has(txId)) {
+            cleaned.push(synthesizeCodecFallback(txId));
+            covered.add(txId);
+          }
+        }
+
+        return cleaned;
       } catch (err) {
         lastErr = err;
         if (timedOut) {
@@ -455,8 +588,19 @@ async function runOneBatch(
           continue;
         }
         const status = (err as { status?: number })?.status;
-        const isRetryable =
+        const errMsg = err instanceof Error ? err.message : String(err);
+        const isHttpRetryable =
           typeof status === "number" && RETRYABLE_STATUS.has(status);
+        // Model-shape errors (missing tool_use block, missing `matches`
+        // array) used to be fatal at attempt 1 — production saw batches
+        // like "tool_use input missing 'matches' array" die on the very
+        // first try. They're now retryable: transient glitches usually
+        // clear on the second attempt, and we still give up after the
+        // regular retry budget. The HTTP path is unchanged.
+        const isShapeError =
+          errMsg.startsWith("model response did not contain a tool_use block") ||
+          errMsg.startsWith("tool_use input missing 'matches'");
+        const isRetryable = isHttpRetryable || isShapeError;
         if (!isRetryable || attempt === maxRetries) {
           throw new Error(
             `categorize batch failed (attempt ${attempt}/${maxRetries}, depth=${depth}, ${Math.round((Date.now() - callStartedAt) / 1000)}s): ${stringifyError(err)}`,
@@ -493,6 +637,31 @@ function combineSignals(
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Build a Codec-fallback placeholder match for a transactionId the AI
+ * couldn't cover. The placeholder lands in the `__codec_fallback__` row
+ * in /review (suggestedAccountEuId === null) — same shape as a real
+ * "no firm" match from the model, just with a clearly-marked `reasoning`
+ * prefix so the UI can surface a "Y kayıt AI kapsamadı" subtitle.
+ *
+ * The `synthetic:` prefix is the extension's signal that this row was
+ * not produced by the LLM — it's a fallback so the operator still sees
+ * the record instead of it vanishing after a batch failure.
+ */
+function synthesizeCodecFallback(transactionId: number): ItemMatch {
+  return {
+    transactionId,
+    matchedField: "keyword1",
+    matchedValue: "",
+    keywordGroup: "unknown",
+    suggestedAccountEuId: null,
+    suggestedAccountName: null,
+    confidence: "low",
+    reasoning:
+      "synthetic: AI bu kaydı sınıflandıramadı; operatör manuel inceleyecek.",
+  };
 }
 
 function stringifyError(err: unknown): string {
