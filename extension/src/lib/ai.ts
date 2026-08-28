@@ -110,10 +110,13 @@ export async function categorize(
     return DEMO_CATEGORIZE_RESPONSE;
   }
 
-  // 3 minutes default — long enough for a 100-item batch under load
-  // (worst observed: ~95s with 8 workers), but short enough that a
-  // truly stuck proxy surfaces an error instead of hanging forever.
-  const stallTimeoutMs = opts.stallTimeoutMs ?? 180_000;
+  // Default stall ceiling — large enough that a 752-item run with the
+  // warm-up pass + a slow tail batch (~204 s observed) doesn't get killed
+  // by the timer even though events ARE flowing the whole time. The timer
+  // is activity-based (reset on every reader.read() resolution below), so
+  // a TRULY stuck proxy still surfaces an error fast — within
+  // `stallTimeoutMs` of the LAST byte received, not of the fetch start.
+  const stallTimeoutMs = opts.stallTimeoutMs ?? 600_000;
 
   let res: Response;
   try {
@@ -157,9 +160,28 @@ export async function categorize(
   let donePayload: CategorizeResponse | null = null;
   let errorMessage: string | null = null;
 
+  // Activity-based stall timer: an absolute deadline that pump() resets
+  // on every byte received from the proxy (heartbeats included). The
+  // stall guard sleeps in small chunks and only throws when the deadline
+  // is actually in the past — so a slow but-live run never trips the
+  // timer, only a truly stuck proxy does.
+  //
+  // Bug history (2026-08-28): the previous timer was total wall-clock
+  // and killed a 752-item run at t=180s even though batches 1..6 + 8..16
+  // had all streamed through (only batch 7 was still in flight at
+  // t=180s, finished at t=204s). Activity-based timer avoids that.
+  let stallDeadline = Date.now() + stallTimeoutMs;
+  const bumpStall = () => {
+    stallDeadline = Date.now() + stallTimeoutMs;
+  };
+
   const pump = async () => {
     while (true) {
       const { value, done } = await reader.read();
+      // ANY chunk from the proxy — heartbeat or batch event — proves
+      // the connection is alive. Reset the stall deadline BEFORE
+      // processing the bytes so heartbeats also count as activity.
+      if (!done) bumpStall();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
 
@@ -170,7 +192,9 @@ export async function categorize(
         buffer = buffer.slice(nl + 2);
         const parsed = parseSseEvent(raw);
         if (!parsed) continue;
-        // Comments (heartbeats) start with ':' and carry no data.
+        // Comments (heartbeats) start with ':' and carry no data, but
+        // the bytes still count as activity — bump() ran above before
+        // we got here, so heartbeats also reset the stall deadline.
         if (parsed.event === "comment") continue;
         const data = (parsed as SseEvent).data as Record<string, unknown>;
         if (parsed.event === "batch-start") {
@@ -255,10 +279,12 @@ export async function categorize(
     }
   };
 
-  // Race the pump against a stall timer. If we go `stallTimeoutMs`
-  // without any data the proxy is probably stuck mid-batch; abort.
+  // Race the pump against an activity-based stall timer. Every byte
+  // the proxy sends resets the deadline (`stallDeadline.bump()` inside
+  // pump()), so a slow but-live run never trips the timer — only a
+  // truly stuck proxy (no bytes for `stallTimeoutMs` straight) does.
   // Also race the caller's AbortSignal so a UI cancel doesn't have to
-  // wait out the full stall timer.
+  // wait out the full stall window.
   let abortHandler: (() => void) | undefined;
   const aborted = new Promise<never>((_, reject) => {
     if (opts.signal?.aborted) {
@@ -269,16 +295,21 @@ export async function categorize(
     opts.signal?.addEventListener("abort", abortHandler);
   });
 
-  try {
-    await Promise.race([
-      pump(),
-      sleep(stallTimeoutMs).then(() => {
+  const stallGuard = (async () => {
+    while (true) {
+      const remaining = Math.max(50, stallDeadline - Date.now());
+      await sleep(remaining);
+      if (Date.now() >= stallDeadline) {
         throw new Error(
-          `proxy /categorize stalled for ${Math.round(stallTimeoutMs / 1000)}s with no progress`,
+          `proxy /categorize: no data for ${Math.round(stallTimeoutMs / 1000)}s (stalled)`,
         );
-      }),
-      aborted,
-    ]);
+      }
+      // Deadline got bumped during the sleep — loop again with the new remaining.
+    }
+  })();
+
+  try {
+    await Promise.race([pump(), stallGuard, aborted]);
   } finally {
     if (abortHandler) opts.signal?.removeEventListener("abort", abortHandler);
   }

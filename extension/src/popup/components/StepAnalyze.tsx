@@ -151,12 +151,19 @@ export function StepAnalyze() {
     const controller = new AbortController();
     abortRef.current = controller;
 
+    // Hoisted so the catch-block partial-recovery path can reference
+    // the size when persisting the salvaged matches. Throwing inside
+    // the try block (empty subset, cluster guard, etc.) short-circuits
+    // before this assignment, but the catch branch only fires after
+    // the cluster guard ran, so by then itemsToSend is defined.
+    let itemsToSend: UnmatchedItem[] = [];
+
     try {
       // Apply the user's subset choice right before sending. Persist
       // the draft so re-opens remember the selection.
       const chosen = buildSubset();
       await applyDraft(chosen);
-      const itemsToSend = applySubset(session.items, chosen);
+      itemsToSend = applySubset(session.items, chosen);
       if (itemsToSend.length === 0) {
         throw new Error("Subset boş — aralığı kontrol et (örn. 'İlk 600')");
       }
@@ -316,6 +323,62 @@ export function StepAnalyze() {
       const aborted =
         (err as { name?: string })?.name === "AbortError" ||
         msg.toLowerCase().includes("aborted");
+
+      // Partial-recovery: even on error/timeout/abort, if the per-batch
+      // accumulator has matches we MUST flush them to disk and navigate
+      // to /review. The previous behaviour swallowed all of batch N's
+      // work when categorize() threw at t=180s on a legitimate run —
+      // the user saw "all 16 batches green" in the live UI but never
+      // reached the review screen. This path is the safety net that
+      // catches every reason categorize() can throw.
+      const partialMatches = runningMatchesRef.current;
+      if (partialMatches.length > 0) {
+        // Cancel any pending debounced save — we're about to write the
+        // canonical state directly, no point letting the timer race us.
+        if (saveDebounceRef.current) {
+          clearTimeout(saveDebounceRef.current);
+          saveDebounceRef.current = null;
+        }
+        const batchList = progress
+          ? Object.values(progress.batchSummaries).sort((a, b) => a.i - b.i)
+          : [];
+        const next: SessionState = {
+          ...session,
+          matches: partialMatches,
+          model: settings.model,
+          lastBatches: batchList,
+          lastItemsCount: itemsToSend.length,
+        };
+        try {
+          await saveSession(next);
+        } catch (saveErr) {
+          console.error("[analyze] partial saveSession failed:", saveErr);
+        }
+        setSession(next);
+        if (aborted) {
+          toast.push(
+            `İptal edildi ama ${partialMatches.length} eşleşme kurtarıldı.`,
+            "info",
+          );
+        } else {
+          toast.push(
+            `Hata: ${msg} — ama ${partialMatches.length} eşleşme kurtarıldı.`,
+            "info",
+          );
+        }
+        // Show the underlying error in the error pane so the operator
+        // knows WHY the run didn't complete — but DON'T keep them
+        // trapped on the analyze screen with no data.
+        if (!aborted) setError(msg);
+        // Reset running accumulator so a re-run starts clean.
+        runningMatchesRef.current = [];
+        navigate("/review");
+        return;
+      }
+
+      // No matches salvaged: this is a true before-first-batch failure
+      // (network refused, no batches even started, etc.). Stay on the
+      // analyze screen and surface the error normally.
       if (aborted) {
         toast.push("AI çalıştırma iptal edildi", "info");
         setError(null);

@@ -78,6 +78,143 @@ describe("SSE event parsing", () => {
     expect(progressCalls).toEqual([0, 3, 3, 5]);
     fetchStub.mockRestore();
   });
+
+  it("stall timer is activity-based: does NOT fire when heartbeats keep arriving past the deadline", async () => {
+    // Regression (2026-08-28): the previous timer was total wall-clock.
+    // A 752-item run with a slow tail batch streamed heartbeats every
+    // 15s but was killed at t=180s because total runtime > 180s, even
+    // though every batch-done + heartbeat arrived on schedule.
+    //
+    // We simulate the same scenario: one slow reader that emits a
+    // heartbeat every 50ms with stallTimeoutMs=200. The run must NOT
+    // throw "stalled" because activity is constant — only the *gap*
+    // matters.
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      async start(controller) {
+        // 12 heartbeats over 600ms (every 50ms), then the final event.
+        for (let k = 0; k < 12; k++) {
+          await new Promise((r) => setTimeout(r, 50));
+          controller.enqueue(encoder.encode(`: heartbeat ${k}\n\n`));
+        }
+        controller.enqueue(
+          encoder.encode(
+            `event: done\ndata: {"model":"MiniMax-M3","batches":0,"items":0,"matches":[]}\n\n`,
+          ),
+        );
+        controller.close();
+      },
+    });
+    const response = new Response(stream, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+    const fetchStub = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(response as unknown as Response);
+
+    const { categorize } = await import("../lib/ai.js");
+    const start = Date.now();
+    const result = await categorize(
+      "http://proxy.test",
+      "MiniMax-M3",
+      [],
+      [],
+      [],
+      undefined,
+      { stallTimeoutMs: 200 }, // < total runtime (~600ms)
+    );
+    const elapsed = Date.now() - start;
+    expect(result.batches).toBe(0);
+    expect(elapsed).toBeGreaterThan(200); // confirms we DID exceed the deadline
+    fetchStub.mockRestore();
+  });
+
+  it("stall timer DOES fire when reader goes silent for the full deadline", async () => {
+    // The flip side: with NO chunks for the full stallTimeoutMs, the
+    // timer still throws. (Otherwise we'd hang forever on a dead proxy.)
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      async start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            `event: batch-start\ndata: {"i":0,"total":1,"size":3}\n\n`,
+          ),
+        );
+        // Then go silent — never close the stream. The stall guard
+        // must catch this within stallTimeoutMs.
+      },
+    });
+    const response = new Response(stream, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+    const fetchStub = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(response as unknown as Response);
+
+    const { categorize } = await import("../lib/ai.js");
+    const start = Date.now();
+    await expect(
+      categorize(
+        "http://proxy.test",
+        "MiniMax-M3",
+        [],
+        [],
+        [],
+        undefined,
+        { stallTimeoutMs: 250 },
+      ),
+    ).rejects.toThrow(/stalled/);
+    const elapsed = Date.now() - start;
+    // Throws within ~stallTimeoutMs of the last activity, not before.
+    expect(elapsed).toBeGreaterThanOrEqual(250);
+    expect(elapsed).toBeLessThan(2_000); // sanity — not a hang
+    fetchStub.mockRestore();
+  });
+
+  it("synthesises a partial donePayload when stream ends without 'done' but matches arrived", async () => {
+    // The mid-run recovery path: stream closes after some batch-done
+    // events but no terminal `done`. The matches we DID get must
+    // surface as a `partial: true` result instead of throwing.
+    const events = [
+      `event: batch-start\ndata: {"i":0,"total":2,"size":3}\n\n`,
+      `event: batch-done\ndata: {"i":0,"total":2,"matches":[{"transactionId":1,"matchedField":"keyword1","matchedValue":"IPTAL","keywordGroup":"iptal","suggestedAccountEuId":null,"suggestedAccountName":null,"confidence":"high","reasoning":""}],"accumulated":1}\n\n`,
+      `event: batch-start\ndata: {"i":1,"total":2,"size":2}\n\n`,
+      // Stream closes mid-run — no batch-done for batch 1, no done.
+    ];
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const chunk of events) controller.enqueue(encoder.encode(chunk));
+        controller.close();
+      },
+    });
+    const response = new Response(stream, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+    const fetchStub = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(response as unknown as Response);
+
+    const { categorize } = await import("../lib/ai.js");
+    const result = await categorize(
+      "http://proxy.test",
+      "MiniMax-M3",
+      [],
+      [],
+      [],
+      undefined,
+      { stallTimeoutMs: 5_000 },
+    );
+    expect(result.partial).toBe(true);
+    expect(result.matches).toHaveLength(1);
+    expect(result.matches[0].transactionId).toBe(1);
+    expect(result.failedBatches).toBeDefined();
+    expect(result.failedBatches![0].error).toMatch(/stream ended without 'done'/);
+    fetchStub.mockRestore();
+  });
 });
 
 describe("buildKeywordRows", () => {
