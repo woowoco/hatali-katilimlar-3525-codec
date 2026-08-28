@@ -33,6 +33,45 @@ import { useToast } from "./Toast.js";
 
 type RowFilter = "all" | "high" | "medium" | "low" | "codec";
 
+/**
+ * Per-section pagination: how many txIds each `FirmSectionView` renders
+ * before the operator has to explicitly expand. Why this exists:
+ *
+ * A 1500-item categorize run with clustering replicates to ~3300 matches.
+ * When those happen to land in one or two heavy firms, mounting ALL the
+ * `<tr>` + per-row `<select>` nodes in a single React commit freezes the
+ * popup window for tens of seconds — the user sees the skeleton phase
+ * forever, the page never reaches `phase === "ready"`, and the data that
+ * IS on disk looks unreachable.
+ *
+ * Capping the initial render at `SECTION_PAGE_SIZE` items per section
+ * keeps the first paint under ~2500 DOM nodes even for the worst-case
+ * 50-firm split, well inside what Chromium can commit without jank.
+ * Operators click "Tümünü göster" on the section(s) they need to act on.
+ *
+ * The selection set (`Set<number>`) is independent of visibility — the
+ * section header still shows the correct "N tx seçili" count, and the
+ * "Tümünü seç" / "Tümünü seçimi kaldır" checkbox covers any hidden items.
+ */
+const SECTION_PAGE_SIZE = 50;
+
+// Inline style for the in-text "show more" / "show all" links next to
+// the section header. Used instead of a `ghost`/`link` class because
+// neither is currently defined in styles.css — the codebase uses bare
+// `ghost sm` for unrelated button affordances, so we keep pagination
+// affordances visually distinct (no border, accent underline).
+const linkButtonStyle: React.CSSProperties = {
+  padding: 0,
+  margin: 0,
+  background: "transparent",
+  border: "none",
+  color: "var(--accent)",
+  textDecoration: "underline",
+  cursor: "pointer",
+  fontSize: "inherit",
+  fontFamily: "inherit",
+};
+
 // Stable empty Set used in place of `chargedSet` when calling
 // `buildKeywordRows`. We deliberately want buildKeywordRows to keep ALL
 // matches (including just-charged ones) in the underlying rows, and
@@ -1015,6 +1054,31 @@ function FirmSectionView({
     (it) => it.source === "tx-override",
   ).length;
 
+  // --- Per-section pagination ---------------------------------------------
+  // Why: see `SECTION_PAGE_SIZE` docstring. We render only the first N
+  // txIds of the section and expose "Daha fazla göster" / "Tümünü göster"
+  // / "Daralt" affordances at the section footer. Selection, filter, and
+  // section-level charge all operate on `section.items` (not the sliced
+  // `visibleItems`), so operators can still "Tümünü seç" and charge an
+  // entire firm without expanding every row.
+  const [expandedSize, setExpandedSize] = useState<number>(() =>
+    Math.min(SECTION_PAGE_SIZE, totalIds),
+  );
+  // Reset the page window if the section's item list itself changes
+  // (filter, reassign, new run). Without this the section could end up
+  // holding a stale `expandedSize > totalIds` from a previous dataset.
+  useEffect(() => {
+    setExpandedSize((cur) => Math.min(cur, totalIds));
+  }, [totalIds]);
+  const visibleItems = useMemo(
+    () => section.items.slice(0, expandedSize),
+    [section.items, expandedSize],
+  );
+  const hiddenCount = totalIds - visibleItems.length;
+  const showMore = () => setExpandedSize((c) => Math.min(c + SECTION_PAGE_SIZE, totalIds));
+  const showAll = () => setExpandedSize(totalIds);
+  const collapse = () => setExpandedSize(SECTION_PAGE_SIZE);
+
   return (
     <section
       className={`review-firm-section ${isCodec ? "codec" : ""}`}
@@ -1026,6 +1090,12 @@ function FirmSectionView({
         </span>
         <span className="muted" style={{ fontSize: 10.5 }}>
           {totalIds} tx · {section.selectedCount} seçili
+          {hiddenCount > 0 && (
+            <>
+              {" "}
+              · <strong>{visibleItems.length}</strong> görünüyor
+            </>
+          )}
           {txOverridesCount > 0 && (
             <>
               {" "}
@@ -1040,6 +1110,23 @@ function FirmSectionView({
           accountEuId={section.accountEuId}
           accountName={section.accountName ?? "Bilinmeyen firma"}
         />
+      )}
+
+      {hiddenCount > 0 && (
+        <div className="muted" style={{ fontSize: 10.5, padding: "2px 0 4px" }}>
+          İlk {visibleItems.length} txId gösteriliyor —{" "}
+          <button
+            onClick={showMore}
+            title={`Sonraki ${Math.min(SECTION_PAGE_SIZE, hiddenCount)} txId'i göster`}
+            style={linkButtonStyle}
+          >
+            {Math.min(SECTION_PAGE_SIZE, hiddenCount)} daha göster
+          </button>
+          {" · "}
+          <button onClick={showAll} title={`Section'daki tüm ${totalIds} txId'i göster`} style={linkButtonStyle}>
+            tümünü göster ({hiddenCount} gizli)
+          </button>
+        </div>
       )}
 
       <table className="review-tx-table">
@@ -1071,7 +1158,7 @@ function FirmSectionView({
           </tr>
         </thead>
         <tbody>
-          {section.items.map((item) => {
+          {visibleItems.map((item) => {
             const it = itemsById.get(item.transactionId);
             const isSelected = selected.has(item.transactionId);
             const isTxOverridden = item.source === "tx-override";
@@ -1165,6 +1252,47 @@ function FirmSectionView({
           })}
         </tbody>
       </table>
+
+      {hiddenCount > 0 && totalIds > SECTION_PAGE_SIZE && (
+        <div
+          className="muted"
+          style={{
+            fontSize: 10.5,
+            padding: "6px 0 2px",
+            display: "flex",
+            gap: 8,
+            justifyContent: "flex-end",
+          }}
+        >
+          <button className="ghost sm" onClick={showMore}>
+            +{Math.min(SECTION_PAGE_SIZE, hiddenCount)} daha
+          </button>
+          <button className="ghost sm" onClick={showAll}>
+            Tümünü göster
+          </button>
+        </div>
+      )}
+      {hiddenCount > 0 && totalIds <= SECTION_PAGE_SIZE && (
+        // shouldn't happen given the math but kept for safety
+        <div className="muted" style={{ fontSize: 10.5, padding: "4px 0" }}>
+          {hiddenCount} txId gizli
+        </div>
+      )}
+      {hiddenCount === 0 && totalIds > SECTION_PAGE_SIZE && (
+        <div
+          className="muted"
+          style={{
+            fontSize: 10.5,
+            padding: "4px 0",
+            display: "flex",
+            justifyContent: "flex-end",
+          }}
+        >
+          <button className="ghost sm" onClick={collapse} title="İlk 50 satıra dön">
+            Daralt
+          </button>
+        </div>
+      )}
 
       <div className="review-firm-section__footer">
         <span className="muted" style={{ fontSize: 11 }}>
