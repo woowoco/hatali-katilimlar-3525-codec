@@ -124,6 +124,19 @@ export interface Settings {
    * verification only — no production workflow should ever enable it.
    */
   demoMode: boolean;
+  /**
+   * Opt-in fingerprint clustering. When true, /analyze groups items by
+   * normalized (kw1, kw2, msgContent) before sending, sending ONE
+   * representative per cluster to the LLM and replicating the LLM's
+   * verdict to all cluster members on the way back. Off by default —
+   * the existing per-row LLM path is the safe baseline for production.
+   *
+   * Safety contract: this only changes how many LLM calls happen, not
+   * who triggers them. `chargeOnce` still requires a manual UI click.
+   * Cluster expansion preserves every original transactionId verbatim —
+   * no txId is ever lost, duplicated, or remapped.
+   */
+  clusteringEnabled?: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -132,6 +145,7 @@ export const DEFAULT_SETTINGS: Settings = {
   model: "MiniMax-M3",
   throttleMs: 200,
   demoMode: false,
+  clusteringEnabled: false,
 };
 
 // --- Charge flow ------------------------------------------------------------

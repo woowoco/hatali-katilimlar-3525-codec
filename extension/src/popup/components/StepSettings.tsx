@@ -4,6 +4,7 @@ import {
   FlaskConical,
   FileSearch,
   KeyRound,
+  Layers,
   ListChecks,
   RefreshCw,
   Save,
@@ -201,14 +202,16 @@ export function StepSettings() {
    *   - chrome.storage.local `session.v1` (handled by clearSession)
    *
    * What survives:
-   *   - settings (proxyUrl, model selection, throttleMs, demoMode flag)
+   *   - proxyUrl, model, throttleMs (Settings fields unrelated to demo)
    *   - audit log (history of Charged POSTs actually sent)
    *   - keyword override rules (`overrides.v1`, not session-scoped)
    *
-   * settings.demoMode is intentionally NOT turned off — flipping it
-   * back on for the next "Demo verisini yükle" should be one click.
-   * The toggle's text already says "(mock veri)" so it's not silently
-   * dangerous: StepFetch / StepAnalyze clearly route through the mock.
+   * `demoMode` is intentionally turned OFF too. Without this, the next
+   * `getCustomersToBeCharged` / `getUnmatchedList` in StepFetch would
+   * still route through `mockHandleRequest` and re-populate `session.items`
+   * with the SAME 79-item fixture — making the operator believe the demo
+   * data wasn't actually cleared. The operator must opt back into demo
+   * mode explicitly via the toggle if they want to re-load it.
    */
   const handleClearDemoData = async () => {
     const hasData =
@@ -218,14 +221,25 @@ export function StepSettings() {
     if (!hasData) return;
     const ok = confirm(
       "Demo verisi (müşteri listesi, kayıtlar, AI eşleşmeleri, ücretlendirme ve override'lar) silinecek.\n\n" +
-        "Ayarların, audit log ve kalıcı keyword kuralların korunacak.\n\n" +
+        "Demo modu da kapatılacak — bir sonraki 'Müşterileri ve listeyi çek' gerçek backend'e gidecek.\n\n" +
+        "Audit log ve kalıcı keyword kuralların korunacak.\n\n" +
         "Devam edilsin mi?",
     );
     if (!ok) return;
     try {
       await clearSession();
       setSession(EMPTY_SESSION);
-      toast.push("Demo verisi silindi — tüm UI sıfırlandı.", "info");
+      // Turn off demo mode AND persist, so the next StepFetch click routes
+      // through the real backend instead of re-populating the fixture.
+      if (settings.demoMode) {
+        const nextSettings = { ...settings, demoMode: false };
+        setSettings(nextSettings);
+        await saveSettings(nextSettings);
+      }
+      toast.push(
+        "Demo verisi silindi ve demo modu kapatıldı — gerçek backend'e geçebilirsin.",
+        "info",
+      );
       // Force-navigate to /settings so any stale /review state (cached
       // memo'd firmSections, selection Set<number>, etc.) is unmounted.
       // The reachable Set computed in App.tsx already reflects the empty
@@ -412,6 +426,50 @@ export function StepSettings() {
             <ListChecks size={12} /> Kuralları yönet →
           </button>
         </div>
+      </div>
+
+      <div
+        style={{
+          marginTop: 16,
+          paddingTop: 12,
+          borderTop: "1px solid var(--border)",
+        }}
+      >
+        <label
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            cursor: "pointer",
+            fontWeight: 500,
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={settings.clusteringEnabled ?? false}
+            onChange={async (e) => {
+              const next = { ...settings, clusteringEnabled: e.target.checked };
+              setSettings(next);
+              // Persist immediately — the toggle drives the /analyze run
+              // shape, so it has to survive a popup reload.
+              try { await saveSettings(next); }
+              catch (err) {
+                toast.push(
+                  `Clustering ayarı kaydedilemedi: ${err instanceof Error ? err.message : String(err)}`,
+                  "error",
+                );
+              }
+            }}
+          />
+          <Layers size={12} /> Clustering modu (fingerprint ön-analizi)
+        </label>
+        <p className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+          LLM'e göndermeden önce normalize edilmiş{" "}
+          <code className="kbd">(kw1, kw2, msgContent)</code> üçlüsü aynı
+          olan kayıtları tek temsilci olarak gönderir; cevap tüm kümeye
+          uygulanır. <b>Daha az LLM çağrısı, daha düşük maliyet.</b> Şarj
+          akışı değişmez — hâlâ her satırı sen manuel tetiklersin.
+        </p>
       </div>
 
       <div

@@ -9,10 +9,15 @@ import {
   X,
   Wifi,
   Filter,
+  Layers,
 } from "lucide-react";
 import { categorize, type CategorizeProgressInfo, applySubset } from "../../lib/ai.js";
+import {
+  clusterByFingerprint,
+  expandClusterMatches,
+} from "../../lib/clustering.js";
 import { saveSession, loadOverrides, type SessionState, type ItemSubset } from "../../lib/store.js";
-import type { CategorizeBatchSummary, KeywordOverride } from "../../types.js";
+import type { CategorizeBatchSummary, ItemMatch, KeywordOverride, UnmatchedItem } from "../../types.js";
 import type { RouteCtx } from "../App.js";
 import { useToast } from "./Toast.js";
 
@@ -149,10 +154,29 @@ export function StepAnalyze() {
         throw new Error("Subset boş — aralığı kontrol et (örn. 'İlk 600')");
       }
 
+      // Opt-in fingerprint clustering: when `clusteringEnabled` is on,
+      // collapse identical (kw1, kw2, msgContent) items into one
+      // representative before sending. The LLM verdict is replicated
+      // back to every cluster member via `expandClusterMatches`. Off
+      // (default) keeps the legacy per-item path verbatim.
+      const clusteringOn = settings.clusteringEnabled === true;
+      let llmItems: UnmatchedItem[];
+      let expand: (matches: ItemMatch[]) => ItemMatch[];
+      let clusterMapForGuard: Map<number, number[]> | null = null;
+      if (clusteringOn) {
+        const { representatives, clusterMap } = clusterByFingerprint(itemsToSend);
+        llmItems = representatives;
+        clusterMapForGuard = clusterMap;
+        expand = (matches) => expandClusterMatches(matches, clusterMap);
+      } else {
+        llmItems = itemsToSend;
+        expand = (matches) => matches;
+      }
+
       const result = await categorize(
         settings.proxyUrl,
         settings.model,
-        itemsToSend,
+        llmItems,
         session.customers,
         activeOverrides,
         (info) => {
@@ -170,20 +194,40 @@ export function StepAnalyze() {
         { signal: controller.signal, demoMode: settings.demoMode },
       );
 
+      const finalMatches = expand(result.matches);
+
+      // Defense-in-depth: if clustering is on, every original txId in
+      // `itemsToSend` must appear exactly once in `finalMatches`. The
+      // LLM already returns one match per representative and expansion
+      // is lossless by construction — this catches any future drift.
+      if (clusteringOn && clusterMapForGuard) {
+        const originalIds = new Set(itemsToSend.map((it) => it.transactionId));
+        const missing = [...originalIds].filter(
+          (id) => !finalMatches.some((m) => m.transactionId === id),
+        );
+        if (missing.length > 0) {
+          throw new Error(
+            `cluster expansion missed ${missing.length} txIds (örn. ${missing.slice(0, 5).join(", ")})`,
+          );
+        }
+      }
+
       const batchList = progress
         ? Object.values(progress.batchSummaries).sort((a, b) => a.i - b.i)
         : [];
       const next: SessionState = {
         ...session,
-        matches: result.matches,
+        matches: finalMatches,
         model: result.model,
         lastBatches: batchList,
-        lastItemsCount: result.items ?? session.items.length,
+        lastItemsCount: result.items ?? itemsToSend.length,
       };
       await saveSession(next);
       setSession(next);
       toast.push(
-        `${result.matches.length} eşleşme bulundu (${result.batches} batch)`,
+        `${finalMatches.length} eşleşme bulundu (${result.batches} batch${
+          clusteringOn ? `, clustering açık: ${llmItems.length} temsilci` : ""
+        })`,
         "success",
       );
       navigate("/review");
@@ -231,6 +275,33 @@ export function StepAnalyze() {
     const b = Math.max(a + 1, Math.floor(Number(draftEnd) || 0));
     return Math.max(0, Math.min(b, session.items.length) - Math.min(a, session.items.length));
   }, [busy, draftMode, draftN, draftStart, draftEnd, session.items.length]);
+
+  /**
+   * Subset → cluster result. Holds the actual subset items (what the
+   * operator selected) and, when clustering is ON, the representative
+   * items that the LLM would see (the subset collapsed by fingerprint).
+   *
+   * Single source of truth: the preview counts AND the preview tables
+   * all read from this memo, so `clusterByFingerprint` runs once per
+   * subset/toggle change instead of twice.
+   */
+  const subsetItems = useMemo(() => {
+    if (busy) return [];
+    return applySubset(session.items, buildSubset());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [busy, session.items, draftMode, draftN, draftStart, draftEnd]);
+
+  /**
+   * Items that would actually reach the LLM. Equal to `subsetItems`
+   * when clustering is OFF; the fingerprint representatives when ON.
+   */
+  const llmItems = useMemo(() => {
+    if (!settings.clusteringEnabled) return subsetItems;
+    return clusterByFingerprint(subsetItems).representatives;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subsetItems, settings.clusteringEnabled]);
+
+  const representativeCount = llmItems.length;
 
   const progressLabel = progress
     ? progress.batchesTotal
@@ -444,11 +515,39 @@ export function StepAnalyze() {
             </label>
           </div>
           <div className="subset-picker__preview">
-            <strong>{previewCount.toLocaleString("tr-TR")}</strong>{" "}
-            kayıt gönderilecek
+            <div>
+              <strong>Seçili:</strong>{" "}
+              <strong>{previewCount.toLocaleString("tr-TR")}</strong> kayıt
+            </div>
+            <div style={{ marginTop: 2, display: "flex", alignItems: "center", gap: 6 }}>
+              <strong>LLM'e gönderilecek:</strong>{" "}
+              <strong>{representativeCount.toLocaleString("tr-TR")}</strong>{" "}
+              {settings.clusteringEnabled ? "temsilci" : "kayıt"}
+              {settings.clusteringEnabled && (
+                <span
+                  className="pill"
+                  style={{
+                    background: "var(--accent-bg, rgba(99,102,241,0.15))",
+                    color: "var(--accent)",
+                    fontSize: 10,
+                    padding: "1px 6px",
+                    marginLeft: 2,
+                  }}
+                  title="Clustering modu: benzer (kw1, kw2, msgContent) kayıtlar tek temsilci olarak gönderilir"
+                >
+                  <Layers size={10} style={{ verticalAlign: "middle", marginRight: 3 }} />
+                  clustering
+                </span>
+              )}
+              {settings.clusteringEnabled && previewCount > 0 && (
+                <span style={{ opacity: 0.7 }}>
+                  · ×{(previewCount / Math.max(representativeCount, 1)).toFixed(1)} kazanç
+                </span>
+              )}
+            </div>
             {previewCount > 0 && (
-              <span style={{ marginLeft: 8, opacity: 0.7 }}>
-                · ~{Math.ceil(previewCount / 50)} batch · ~{Math.ceil(previewCount / 10)}s tahmini
+              <span style={{ marginLeft: 0, marginTop: 4, opacity: 0.7, display: "block" }}>
+                ~{Math.ceil(representativeCount / 50)} batch · ~{Math.ceil(representativeCount / 10)}s tahmini
               </span>
             )}
           </div>
@@ -456,7 +555,23 @@ export function StepAnalyze() {
       )}
 
       {!busy && previewCount > 0 && (
-        <PreviewTable items={applySubset(session.items, buildSubset())} />
+        <>
+          <PreviewTable
+            title={
+              settings.clusteringEnabled
+                ? "Seçili kayıtlar (subset)"
+                : "AI'ya gönderilecek kayıtlar (önizleme)"
+            }
+            items={subsetItems}
+          />
+          {settings.clusteringEnabled && (
+            <PreviewTable
+              title="LLM'e gönderilecek temsilciler (clustering sonrası)"
+              items={llmItems}
+              accent="clustering"
+            />
+          )}
+        </>
       )}
 
       {!busy && activeOverrides.length > 0 && (
@@ -563,24 +678,49 @@ export function StepAnalyze() {
 }
 
 /**
- * Read-only preview of the items that will be sent to /categorize.
- * Renders the first 20 rows + a "…and N more" footer. Lets the user
- * sanity-check the payload before clicking "AI'ı çalıştır".
+ * Read-only preview of items. Renders ALL rows (no truncation) — the
+ * operator asked to see the complete payload before clicking "AI'ı
+ * çalıştır", especially in clustering mode where the LLM-side
+ * representatives differ from the original subset. The scroll container
+ * is `max-height: 220px` in CSS so the table doesn't push other UI
+ * off-screen on a 2700-item HAR.
+ *
+ * `title`  — header label. Pass a different label per table when two
+ *             are shown (subset vs. representatives).
+ * `accent` — when "clustering", the header gets an accent tint so the
+ *             operator can visually tell "this is the LLM-side list".
  */
-function PreviewTable({ items }: { items: import("../../types.js").UnmatchedItem[] }) {
-  const shown = items.slice(0, 20);
-  const more = items.length - shown.length;
+function PreviewTable({
+  items,
+  title = "AI'ya gönderilecek kayıtlar (önizleme)",
+  accent,
+}: {
+  items: import("../../types.js").UnmatchedItem[];
+  title?: string;
+  accent?: "clustering";
+}) {
   return (
-    <div className="preview-table">
+    <div
+      className="preview-table"
+      style={
+        accent === "clustering"
+          ? { borderColor: "var(--accent)" }
+          : undefined
+      }
+    >
       <div className="preview-table__head">
         <span>
-          <ListChecks size={10} style={{ verticalAlign: "middle" }} /> AI'ya
-          gönderilecek kayıtlar (önizleme)
+          {accent === "clustering" ? (
+            <Layers size={10} style={{ verticalAlign: "middle", marginRight: 3 }} />
+          ) : (
+            <ListChecks size={10} style={{ verticalAlign: "middle" }} />
+          )}{" "}
+          {title}
         </span>
         <span>{items.length.toLocaleString("tr-TR")} satır</span>
       </div>
       <div className="preview-table__scroll">
-        {shown.map((it) => (
+        {items.map((it) => (
           <div key={it.transactionId} className="preview-table__row">
             <span className="preview-table__cell preview-table__cell--meta">
               #{it.transactionId}
@@ -598,12 +738,6 @@ function PreviewTable({ items }: { items: import("../../types.js").UnmatchedItem
           </div>
         ))}
       </div>
-      {more > 0 && (
-        <div className="preview-table__more">
-          …ve {more.toLocaleString("tr-TR")} satır daha (gönderilecek ama
-          burada gösterilmiyor)
-        </div>
-      )}
     </div>
   );
 }
