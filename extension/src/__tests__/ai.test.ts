@@ -9,6 +9,8 @@ import {
   resolveFirm,
   resolveFirmForTx,
   sanitizeAccountEuId,
+  selectNewBatchMatches,
+  type CategorizeProgressInfo,
   type FirmSectionItem,
   type KeywordRow,
 } from "../lib/ai.js";
@@ -77,6 +79,127 @@ describe("SSE event parsing", () => {
     // start-0 → 0, done-0 → 3, start-1 → 3 (no change), done-1 → 5
     expect(progressCalls).toEqual([0, 3, 3, 5]);
     fetchStub.mockRestore();
+  });
+
+  it("selectNewBatchMatches: callback re-fires for the SAME finished batch do not re-emit its matches (regression for /review duplicates)", () => {
+    // Regression (2026-08-28): production run showed #13083146 fourteen
+    // times in a single keyword row because StepAnalyze's progress
+    // callback fired ~14 times after the batch containing that txId
+    // finished (once per subsequent SSE event: next batch-start,
+    // next batch-timeout, heartbeats, etc.). Each invocation re-read
+    // `info.finishedBatches[length-1]` and re-concatenated the same
+    // matchesList into the running accumulator.
+    //
+    // The fix routes consumer-side accumulation through this helper:
+    // the seen-set gates re-emission so each batch's matches are added
+    // exactly once regardless of how many times onProgress fires for it.
+    const makeInfo = (): CategorizeProgressInfo => ({
+      batchesTotal: 2,
+      accumulatedMatches: 5,
+      batchSummaries: {
+        0: {
+          i: 0,
+          size: 3,
+          matches: 3,
+          accumulated: 3,
+          matchesList: [m(1, "iptal", null), m(2, "iptal", null), m(3, "iptal", null)],
+        },
+        1: {
+          i: 1,
+          size: 2,
+          matches: 2,
+          accumulated: 5,
+          matchesList: [m(4, "odeme", null), m(5, "odeme", null)],
+        },
+      },
+      finishedBatches: [0, 1],
+      timedOutBatches: [],
+      currentTimeoutMs: 90_000,
+      consecutiveTimeouts: 0,
+    });
+
+    const seen = new Set<number>();
+
+    // First invocation — both batches are new. The caller would
+    // append these matches and add 0 + 1 to their seen-set.
+    let r = selectNewBatchMatches(makeInfo(), seen);
+    expect(r.newIndices).toEqual([0, 1]);
+    expect(r.matches.map((x) => x.transactionId)).toEqual([1, 2, 3, 4, 5]);
+    for (const idx of r.newIndices) seen.add(idx);
+
+    // Progress callback fires AGAIN with the same info (next batch-start
+    // arrives, or a heartbeat, or anything else). Helper MUST return
+    // nothing — the bug previously re-emitted all 5 matches here.
+    r = selectNewBatchMatches(makeInfo(), seen);
+    expect(r.newIndices).toEqual([]);
+    expect(r.matches).toEqual([]);
+
+    // A third / fourth / fifth invocation with the same info — still
+    // nothing new. This is the shape that produced 14 copies in prod.
+    for (let k = 0; k < 12; k++) {
+      const rr = selectNewBatchMatches(makeInfo(), seen);
+      expect(rr.newIndices).toEqual([]);
+      expect(rr.matches).toEqual([]);
+    }
+  });
+
+  it("selectNewBatchMatches: out-of-order completion (parallel workers) does not skip batches", () => {
+    // Production runs 16 workers in parallel — batches can finish in
+    // submission order, reverse, or any interleaving. A "last index"
+    // guard would skip the earlier-finished batch on a later call and
+    // never re-emit it. The helper walks `finishedBatches` in
+    // completion order so any batch not yet in `seen` is emitted.
+    const seen = new Set<number>();
+
+    // First callback: only batch 5 finished (out-of-order).
+    const info1: CategorizeProgressInfo = {
+      batchesTotal: 3,
+      accumulatedMatches: 2,
+      batchSummaries: {
+        5: {
+          i: 5,
+          size: 2,
+          matches: 2,
+          accumulated: 2,
+          matchesList: [m(50, "iptal", null), m(51, "iptal", null)],
+        },
+      },
+      finishedBatches: [5],
+      timedOutBatches: [],
+      currentTimeoutMs: 90_000,
+      consecutiveTimeouts: 0,
+    };
+    let r = selectNewBatchMatches(info1, seen);
+    expect(r.newIndices).toEqual([5]);
+    expect(r.matches.map((x) => x.transactionId)).toEqual([50, 51]);
+    for (const idx of r.newIndices) seen.add(idx);
+
+    // Second callback: batch 1 finished (still earlier index, no
+    // re-emission of batch 5). Helper must surface batch 1 only.
+    const info2: CategorizeProgressInfo = {
+      ...info1,
+      accumulatedMatches: 5,
+      batchSummaries: {
+        ...info1.batchSummaries,
+        1: {
+          i: 1,
+          size: 3,
+          matches: 3,
+          accumulated: 5,
+          matchesList: [m(10, "odeme", null), m(11, "odeme", null), m(12, "odeme", null)],
+        },
+      },
+      finishedBatches: [5, 1],
+    };
+    r = selectNewBatchMatches(info2, seen);
+    expect(r.newIndices).toEqual([1]);
+    expect(r.matches.map((x) => x.transactionId)).toEqual([10, 11, 12]);
+    for (const idx of r.newIndices) seen.add(idx);
+
+    // Third callback: same info (re-fire). Nothing new.
+    r = selectNewBatchMatches(info2, seen);
+    expect(r.newIndices).toEqual([]);
+    expect(r.matches).toEqual([]);
   });
 
   it("stall timer is activity-based: does NOT fire when heartbeats keep arriving past the deadline", async () => {

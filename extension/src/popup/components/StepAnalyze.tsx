@@ -11,7 +11,7 @@ import {
   Filter,
   Layers,
 } from "lucide-react";
-import { categorize, type CategorizeProgressInfo, applySubset } from "../../lib/ai.js";
+import { categorize, type CategorizeProgressInfo, applySubset, selectNewBatchMatches } from "../../lib/ai.js";
 import {
   clusterByFingerprint,
   expandClusterMatches,
@@ -59,6 +59,16 @@ export function StepAnalyze() {
   // writes the partial result so a mid-run timeout/error never wipes
   // out already-classified records. See `docs/SAFETY-CONTRACT.md` §3.
   const runningMatchesRef = useRef<ItemMatch[]>([]);
+  // Track which batch indices we've already appended to the accumulator.
+  // The progress callback fires on EVERY SSE event (batch-start,
+  // batch-done, batch-timeout, …), not just batch-done — so without this
+  // set we'd re-append `info.finishedBatches[length-1]` once per event
+  // and the same batch's matches would land in `runningMatchesRef` many
+  // times (production saw #13083146 fourteen times in one row from a
+  // single batch). Set is keyed by batchIndex — completion order can
+  // differ from submission order with parallel workers, so a "last
+  // index" guard would miss out-of-order appends.
+  const appendedBatchIndicesRef = useRef<Set<number>>(new Set());
   const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Local subset editor state. `subset` is the persisted preference
@@ -193,6 +203,7 @@ export function StepAnalyze() {
       // matches are already in chrome.storage.local and the operator
       // can navigate to /review without losing anything.
       runningMatchesRef.current = [];
+      appendedBatchIndicesRef.current = new Set();
       if (saveDebounceRef.current) {
         clearTimeout(saveDebounceRef.current);
         saveDebounceRef.current = null;
@@ -245,15 +256,23 @@ export function StepAnalyze() {
           // (was just a count). Append expanded matches to the running
           // accumulator and trigger a debounced save so a mid-run
           // timeout/error doesn't wipe out already-classified records.
-          const latest = info.finishedBatches[info.finishedBatches.length - 1];
-          if (latest !== undefined) {
-            const summary = info.batchSummaries[latest];
-            if (summary?.matchesList && summary.matchesList.length > 0) {
-              const expanded = expand(summary.matchesList);
-              runningMatchesRef.current =
-                runningMatchesRef.current.concat(expanded);
-              debouncedSave();
+          //
+          // Walk every index in `finishedBatches` via the dedup helper
+          // — the callback fires multiple times per batch (once per SSE
+          // event after the batch-done) so a "last index" pick would
+          // re-append the same batch on every subsequent event.
+          const { matches: newMatches, newIndices } = selectNewBatchMatches(
+            info,
+            appendedBatchIndicesRef.current,
+          );
+          if (newIndices.length > 0) {
+            const expanded = expand(newMatches);
+            runningMatchesRef.current =
+              runningMatchesRef.current.concat(expanded);
+            for (const idx of newIndices) {
+              appendedBatchIndicesRef.current.add(idx);
             }
+            debouncedSave();
           }
         },
         { signal: controller.signal, demoMode: settings.demoMode },

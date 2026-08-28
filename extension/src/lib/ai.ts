@@ -421,6 +421,45 @@ export interface KeywordRow {
   firmGroupKey: string;
 }
 
+/**
+ * Extract the matches from batches the caller has not yet seen.
+ *
+ * The `categorize()` SSE handler fires `onProgress` on every event
+ * (`batch-start`, `batch-done`, `batch-timeout`, …), not just
+ * `batch-done` — so a naive consumer that re-appends
+ * `info.finishedBatches[length-1]` on every invocation ends up
+ * concatenating the SAME batch's `matchesList` many times. Production
+ * saw a single txId (`#13083146`) land in the operator's `/review`
+ * table fourteen times because the progress callback was re-triggered
+ * ~14 times after that batch finished (once per subsequent SSE event).
+ *
+ * Pure helper — caller passes the `info` snapshot and a `Set` of batch
+ * indices they've already processed; we return the matches for any
+ * batches not in that set, plus the new indices to add. Iteration goes
+ * over `info.finishedBatches` (not just the last index) because with
+ * 16 parallel workers the completion order can differ from submission
+ * order — a "last index" guard would miss out-of-order appends.
+ *
+ * Side-effect-free: does NOT mutate `seen`. Caller adds the returned
+ * `newIndices` to their own set after processing.
+ */
+export function selectNewBatchMatches(
+  info: CategorizeProgressInfo,
+  seenBatchIndices: ReadonlySet<number>,
+): { matches: ItemMatch[]; newIndices: number[] } {
+  const newIndices: number[] = [];
+  const matches: ItemMatch[] = [];
+  for (const idx of info.finishedBatches) {
+    if (seenBatchIndices.has(idx)) continue;
+    const summary = info.batchSummaries[idx];
+    if (summary?.matchesList) {
+      matches.push(...summary.matchesList);
+    }
+    newIndices.push(idx);
+  }
+  return { matches, newIndices };
+}
+
 export interface BuildKeywordRowsOptions {
   /**
    * Operator-applied per-row firm overrides (the same map stored on the
