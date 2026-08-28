@@ -16,7 +16,16 @@ import {
 } from "./prompts.js";
 
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
-const MAX_RETRIES = 3;
+/**
+ * Per-batch retry budget. Reduced from 3 → 2 because a 3-attempt budget
+ * with adaptive timeouts (90 → 90 → 150) lets one slow batch monopolise
+ * 5+ minutes of wall-clock time while 15 healthy batches sit idle — the
+ * rest of the work would already be done if we'd moved on sooner. With
+ * 2 attempts the worst case per bad batch is ~3 minutes (90 + 90 + small
+ * backoff), and the operator still sees every txId via the Codec-fallback
+ * synthesis path the worker uses after the second timeout.
+ */
+const MAX_RETRIES = 2;
 
 /** Per-call deadline for one MiniMax request. Starts at the observed
  *  worst-case (~80 s for a 50-item batch under heavy parallelism) and
@@ -223,17 +232,32 @@ export async function categorize(
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      workerErrorsByBatch.set(0, msg);
-      if (msg.includes("timed out")) {
+      const isTimeout = msg.includes("timed out");
+
+      if (isTimeout) {
+        // Same Codec-fallback recovery as the worker pool (see below):
+        // a failed warm-up must NOT lose batch 0 — the worker pool would
+        // skip batch 0 anyway since `next` already advanced past it.
+        const synthMatches = batch0.map((it) => synthesizeCodecFallback(it.transactionId));
+        for (let j = 0; j < synthMatches.length; j++) {
+          allMatches[j] = synthMatches[j];
+        }
+        progress.onBatchDone?.(0, totalBatches, synthMatches);
+        batchesDone++;
+        workerErrorsByBatch.set(
+          0,
+          `MiniMax timeout during warm-up → ${synthMatches.length} Codec fallback synthesised: ${msg}`,
+        );
         batchesTimedOut++;
         adaptive.recordTimeout();
-        const consecutiveTimeouts = batchesTimedOut;
-        progress.onBatchTimeout?.(0, totalBatches, adaptive.ms, consecutiveTimeouts);
+        progress.onBatchTimeout?.(0, totalBatches, adaptive.ms, batchesTimedOut);
         const elapsed = Math.round((Date.now() - runStartedAt) / 1000);
         console.warn(
-          `[categorize] batch 1/${totalBatches} TIMEOUT on warm-up · ${elapsed}s elapsed · next timeout=${Math.round(adaptive.ms / 1000)}s`,
+          `[categorize] batch 1/${totalBatches} TIMEOUT on warm-up · ${elapsed}s elapsed · ` +
+            `synthesised ${synthMatches.length} Codec fallbacks (next timeout=${Math.round(adaptive.ms / 1000)}s)`,
         );
       } else {
+        workerErrorsByBatch.set(0, msg);
         const elapsed = Math.round((Date.now() - runStartedAt) / 1000);
         console.error(
           `[categorize] batch 1/${totalBatches} failed on warm-up · ${elapsed}s elapsed: ${msg}`,
@@ -280,30 +304,46 @@ export async function categorize(
         adaptive.recordSuccess();
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        workerErrorsByBatch.set(i, msg);
-        if (msg.includes("timed out")) {
+        const isTimeout = msg.includes("timed out");
+
+        if (isTimeout) {
+          // Timeouts after MAX_RETRIES are recovered as Codec-fallback
+          // placeholders — every txId in this batch is synthesised with
+          // `suggestedAccountEuId = null` so it lands in the
+          // `__codec_fallback__` row of /review with a "synthetic" prefix
+          // the operator can spot at a glance. The alternative — letting
+          // the batch vanish — would mean those txIds never reach the
+          // review screen and silently get past /categorize, defeating the
+          // point of running it in the first place. The retry budget was
+          // cut to 2 (see MAX_RETRIES) precisely so this fallback kicks
+          // in within ~3 minutes per bad batch instead of 5+.
+          const synthMatches = batch.map((it) => synthesizeCodecFallback(it.transactionId));
+          matches = synthMatches;
+          workerErrorsByBatch.set(
+            i,
+            `MiniMax timeout → ${synthMatches.length} Codec fallback synthesised: ${msg}`,
+          );
           batchesTimedOut++;
           adaptive.recordTimeout();
-          const consecutiveTimeouts = batchesTimedOut;
-          progress.onBatchTimeout?.(
-            i,
-            totalBatches,
-            adaptive.ms,
-            consecutiveTimeouts,
-          );
+          progress.onBatchTimeout?.(i, totalBatches, adaptive.ms, batchesTimedOut);
           const elapsed = Math.round((Date.now() - runStartedAt) / 1000);
           console.warn(
-            `[categorize] batch ${i + 1}/${totalBatches} TIMEOUT on worker ${workerId} · ${elapsed}s elapsed · next timeout=${Math.round(adaptive.ms / 1000)}s`,
+            `[categorize] batch ${i + 1}/${totalBatches} TIMEOUT on worker ${workerId} · ${elapsed}s elapsed · ` +
+              `synthesised ${synthMatches.length} Codec fallbacks (next timeout=${Math.round(adaptive.ms / 1000)}s)`,
           );
         } else {
+          workerErrorsByBatch.set(i, msg);
           const elapsed = Math.round((Date.now() - runStartedAt) / 1000);
           console.error(
             `[categorize] batch ${i + 1}/${totalBatches} failed on worker ${workerId} · ${elapsed}s elapsed: ${msg}`,
           );
+          // Non-timeout failures (5xx storms, shape errors that exhausted
+          // their retries, etc.) still drop the batch — the operator sees
+          // the failedBatches list. We deliberately don't synthesise here
+          // either: the underlying API error likely affects the data
+          // shape, and silently inventing matches would hide the issue.
+          continue;
         }
-        // Do NOT rethrow — let the run continue with the remaining batches.
-        // The partial flag + error list on the response will warn the UI.
-        continue;
       }
       // Write matches into the preallocated slot so order is preserved
       // regardless of completion order.

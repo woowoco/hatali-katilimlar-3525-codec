@@ -147,14 +147,16 @@ describe("categorize", () => {
   });
 
   it("returns partial=true after exhausting retries on 503", async () => {
-    // 503 is retryable, but the 3rd attempt still fails. The new
-    // contract: don't reject the whole categorize() call — surface the
-    // failure as `partial: true` with `failedBatches` so the operator
-    // UI can show "X/Y batches recovered".
+    // 503 is retryable. With MAX_RETRIES=2, the batch fails after 2
+    // attempts. The new contract: don't reject the whole categorize()
+    // call — surface the failure as `partial: true` with `failedBatches`
+    // so the operator UI can show "X/Y batches recovered". Note that
+    // 503s are NOT timeouts, so the worker does NOT synthesise Codec
+    // fallbacks here — those slots stay `undefined` (the operator sees
+    // the failure in failedBatches instead).
     const client = makeFakeClient({
       responses: [],
       failWith: [
-        { status: 503, message: "down" },
         { status: 503, message: "down" },
         { status: 503, message: "down" },
       ],
@@ -166,7 +168,10 @@ describe("categorize", () => {
     expect(result.partial).toBe(true);
     expect(result.failedBatches).toBeDefined();
     expect(result.failedBatches![0].error).toMatch(/categorize batch failed/);
-    expect(client.messages.create).toHaveBeenCalledTimes(3);
+    expect(client.messages.create).toHaveBeenCalledTimes(2);
+    // 503 isn't a timeout — slots stay as the preallocated `undefined`
+    // (the worker skipped the batch, didn't synthesise fallbacks).
+    expect(result.matches.filter((m) => m !== undefined)).toHaveLength(0);
   });
 
   it("does NOT retry on non-retryable errors (e.g. 400) — partial=true", async () => {
@@ -372,7 +377,12 @@ describe("categorize — partial success / adaptive timeout", () => {
 
   it("returns matches from successful batches when some batches time out", async () => {
     // Single batch — call 1 hangs, maxRetries=1 means no retry, the
-    // batch fails fast and the run returns partial.
+    // batch fails fast. New behaviour: timeouts are recovered with
+    // Codec-fallback placeholders so the operator still sees every
+    // txId — those placeholders live in `__codec_fallback__` row of
+    // /review with `suggestedAccountEuId = null` and a "synthetic:"
+    // reasoning prefix. The batch is still flagged as failed so the
+    // operator knows the AI didn't actually classify it.
     const client = makeHangingClient({ hangingCalls: [1] });
     const result = await categorize(
       client as never,
@@ -386,7 +396,13 @@ describe("categorize — partial success / adaptive timeout", () => {
     expect(result.partial).toBe(true);
     expect(result.failedBatches).toBeDefined();
     expect(result.failedBatches!.length).toBe(1);
-    expect(result.matches.filter((m) => m !== undefined)).toHaveLength(0);
+    expect(result.failedBatches![0].error).toMatch(/Codec fallback synthesised/);
+    // All 3 txIds recovered as Codec fallbacks (suggestedAccountEuId=null).
+    const populated = result.matches.filter((m) => m !== undefined);
+    expect(populated).toHaveLength(3);
+    expect(populated.every((m) => m.suggestedAccountEuId === null)).toBe(true);
+    expect(populated.every((m) => m.keywordGroup === "unknown")).toBe(true);
+    expect(populated.every((m) => m.reasoning?.startsWith("synthetic"))).toBe(true);
   });
 
   it("adapts the timeout budget: reports the escalated tier after retries", async () => {
@@ -432,6 +448,10 @@ describe("categorize — partial success / adaptive timeout", () => {
 
   it("global budget exceeded: stops spawning new batches", async () => {
     // All calls hang + a tiny global budget so the run aborts fast.
+    // The budget trips during runOneBatch's retry-budget check; that
+    // surfaces as a timeout-style error, which the worker now turns
+    // into Codec-fallback placeholders (see new contract in
+    // MAX_RETRIES comment).
     const client = makeHangingClient({ hangingCalls: [1, 2, 3] });
     const result = await categorize(
       client as never,
@@ -442,7 +462,101 @@ describe("categorize — partial success / adaptive timeout", () => {
       },
     );
     expect(result.partial).toBe(true);
-    expect(result.matches.filter((m) => m !== undefined)).toHaveLength(0);
+    // All 3 txIds recovered as Codec fallbacks; partial=true still
+    // surfaces via failedBatches so the operator knows AI didn't run.
+    const populated = result.matches.filter((m) => m !== undefined);
+    expect(populated).toHaveLength(3);
+    expect(populated.every((m) => m.suggestedAccountEuId === null)).toBe(true);
+  });
+
+  it("MAX_RETRIES=2: a timeout batch is recovered after 2 attempts (not 3)", async () => {
+    // Both attempts hang; the budget allows enough time for attempt 1
+    // to timeout, attempt 2 to timeout, then runOneBatch to throw on
+    // `attempt === maxRetries`. Previously this was 3 attempts
+    // (~5 minutes in production); now it's 2 (~3 minutes worst case).
+    const client = makeHangingClient({ hangingCalls: [1, 2] });
+    const result = await categorize(
+      client as never,
+      { items: smallBatch, customers: [customer] },
+      {
+        initialTimeoutMsOverride: 30,
+        globalBudgetMsOverride: 5_000,
+      },
+    );
+    expect(result.partial).toBe(true);
+    expect(result.failedBatches).toHaveLength(1);
+    expect(client.messages.create).toHaveBeenCalledTimes(2);
+    // Both attempts timed out → Codec fallback recovery fired.
+    const populated = result.matches.filter((m) => m !== undefined);
+    expect(populated).toHaveLength(3);
+    expect(populated.every((m) => m.suggestedAccountEuId === null)).toBe(true);
+  });
+
+  it("warm-up timeout synthesises Codec fallbacks instead of dropping batch 0", async () => {
+    // 250 items → 5 batches. The warm-up runs batch 0 with MAX_RETRIES=2
+    // attempts; we hang BOTH attempts so the warm-up's runOneBatch throws
+    // timeout. Previously this dropped batch 0 because the worker pool
+    // starts at poolStart=1; now the warm-up path catches the timeout and
+    // synthesises Codec fallbacks for the batch-0 txIds. Remaining
+    // batches fan out normally.
+    const big = Array.from({ length: 250 }, (_, i) => ({
+      ...items[i % items.length],
+      transactionId: 1000 + i,
+    }));
+    // Only need responses for batches 1..4 (200 items). Batch 0's
+    // responses are unused because the warm-up times out.
+    const responses: ToolCallResponse[] = [];
+    for (let i = 50; i < 250; i += 50) {
+      responses.push(responseFor(big.slice(i, i + 50)));
+    }
+    let callIdx = 0;
+    const client = {
+      messages: {
+        create: vi.fn(
+          async (
+            _req: unknown,
+            opts2: { signal?: AbortSignal },
+          ): Promise<ToolCallResponse> => {
+            callIdx++;
+            // Warm-up retries = 2; hang BOTH attempts so the warm-up
+            // surfaces a timeout error to the new recovery path.
+            if (callIdx === 1 || callIdx === 2) {
+              if (opts2.signal?.aborted) {
+                throw new DOMException("aborted", "AbortError");
+              }
+              return new Promise<ToolCallResponse>((_resolve, reject) => {
+                opts2.signal?.addEventListener(
+                  "abort",
+                  () => reject(new DOMException("aborted", "AbortError")),
+                  { once: true },
+                );
+              });
+            }
+            // Worker pool claims batches 1..4 in parallel; the remaining
+            // responses are pre-loaded.
+            return responses.shift() ?? responseFor([]);
+          },
+        ),
+      },
+    };
+    const result = await categorize(
+      client as never,
+      { items: big, customers: [customer] },
+      {
+        initialTimeoutMsOverride: 30,
+        globalBudgetMsOverride: 5_000,
+      },
+    );
+    // Warm-up timed out → all 250 txIds recovered (50 Codec fallback
+    // from warm-up + 200 real from worker pool).
+    expect(result.partial).toBe(true);
+    const populated = result.matches.filter((m) => m !== undefined);
+    expect(populated).toHaveLength(250);
+    // First 50 should all be Codec fallbacks (warm-up synthesised them).
+    const first50 = populated.slice(0, 50);
+    expect(first50.every((m) => m.suggestedAccountEuId === null)).toBe(true);
+    // Failed batch list includes batch 0 (the warm-up).
+    expect(result.failedBatches!.map((f) => f.batchIndex)).toContain(0);
   });
 });
 

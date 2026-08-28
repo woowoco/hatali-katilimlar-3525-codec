@@ -145,6 +145,13 @@ describe("end-to-end mock flow", () => {
     expect(items).toHaveLength(5);
 
     // 2. AI categorization with a fake (read-only) planner.
+    //
+    // The proxy translates the planner's `suggestedAccountEuId` back to
+    // a real UUID before returning (see prompts.ts:resolveCustomerIndexToEuId
+    // — the LLM emits a 1-based customer-list INDEX, not a UUID, to save
+    // ~13 tokens per customer per call). The fake planner therefore emits
+    // indices 1 / 2, and the assertions below compare against the *real*
+    // UUIDs the proxy resolves to.
     const firmAcme = customers[0].acntEuId;
     const firmFoo = customers[1].acntEuId;
     const plan = (its: UnmatchedItem[]): ItemMatch[] =>
@@ -155,7 +162,7 @@ describe("end-to-end mock flow", () => {
             matchedField: "keyword1",
             matchedValue: "IPTAL",
             keywordGroup: "iptal",
-            suggestedAccountEuId: firmAcme,
+            suggestedAccountEuId: 1, // → customers[0].acntEuId (firmAcme)
             suggestedAccountName: customers[0].name,
             confidence: "high",
             reasoning: "kelime iptal",
@@ -166,7 +173,7 @@ describe("end-to-end mock flow", () => {
             matchedField: "keyword1",
             matchedValue: "ODEME",
             keywordGroup: "odeme",
-            suggestedAccountEuId: firmFoo,
+            suggestedAccountEuId: 2, // → customers[1].acntEuId (firmFoo)
             suggestedAccountName: customers[1].name,
             confidence: "high",
             reasoning: "kelime odeme",
