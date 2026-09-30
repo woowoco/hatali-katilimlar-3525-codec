@@ -16,7 +16,11 @@ const PORT = Number(process.env.PORT ?? 8787);
 
 // Models advertised to the extension. Anything reachable on the
 // Anthropic-compatible endpoint is allowed; we just narrow the picker.
+// Order = default recommendation order: newest flash-preview tier first
+// (so the operator sees it without scrolling), then the production
+// default (M3, recommended), then highspeed variants, then older tiers.
 const ADVERTISED_MODELS = [
+  { id: "MiniMax-M3.1-Flash-Preview", label: "MiniMax-M3.1-Flash-Preview (newest flash preview)" },
   { id: "MiniMax-M3", label: "MiniMax-M3 (default · 1M ctx)", recommended: true },
   { id: "MiniMax-M2.7-highspeed", label: "MiniMax-M2.7-highspeed (faster)" },
   { id: "MiniMax-M2.7", label: "MiniMax-M2.7" },
