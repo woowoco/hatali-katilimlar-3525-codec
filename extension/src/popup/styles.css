@@ -1903,6 +1903,169 @@ label:first-child {
   color: var(--success, #5bc878);
 }
 
+/* --------------------------------------------------------------------------
+   Firm-rule card (one card per firm + matchMode pair).
+   Replaces the old per-rule row layout: a single card holds every
+   keyword chip, plus the firm picker / mode / notes / delete controls.
+   See extension/src/popup/components/OverrideEditor.tsx::FirmRuleCard.
+   -------------------------------------------------------------------------- */
+
+.firm-rule-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-1);
+}
+
+.firm-rule-card__top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.firm-rule-card__firm {
+  flex: 1;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-2);
+  color: var(--text-1);
+  font-size: 12px;
+}
+
+.firm-rule-card__mode {
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-2);
+  color: var(--text-1);
+  font-size: 11px;
+}
+
+.firm-rule-card__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px 2px;
+  min-height: 22px;
+}
+
+.firm-rule-card__add {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.firm-rule-card__add input[type="text"] {
+  flex: 1;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-2);
+  color: var(--text-1);
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.firm-rule-card__meta {
+  display: flex;
+  gap: 6px;
+}
+
+.firm-rule-card__notes {
+  flex: 1;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-2);
+  color: var(--text-1);
+  font-size: 11px;
+}
+
+.firm-rule-card--exact {
+  border-left: 3px solid var(--accent, #5b8cff);
+  padding-left: 8px;
+  margin-left: -8px;
+}
+
+.firm-rule-card--exact .firm-rule-card__mode {
+  border-color: var(--accent, #5b8cff);
+  color: var(--accent, #5b8cff);
+}
+
+.firm-rule-card--dup {
+  border-color: var(--danger, #ff6b6b);
+  box-shadow: 0 0 0 1px rgba(255, 107, 107, 0.25) inset;
+}
+
+.firm-rule-card__warn {
+  margin-top: 2px;
+  color: var(--danger, #ff6b6b);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.firm-rule-card .pill.warn {
+  font-size: 9px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(255, 165, 0, 0.15);
+  color: #ffa500;
+}
+
+.firm-rule-card .pill.success {
+  font-size: 9px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(91, 200, 120, 0.15);
+  color: var(--success, #5bc878);
+}
+
+/* Keyword chip — a single keyword bound to its parent rule. Hover lifts
+   the chip slightly to telegraph click targets. */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-2);
+  font-size: 11px;
+  line-height: 1.4;
+  transition: background 0.12s ease;
+}
+
+.chip:hover {
+  background: var(--bg-3, rgba(255, 255, 255, 0.04));
+}
+
+.chip__label {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.chip__x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted, #888);
+  cursor: pointer;
+}
+
+.chip__x:hover {
+  background: var(--danger, #ff6b6b);
+  color: #fff;
+}
+
 /* ==========================================================================
    Audit log toolbar — export buttons
    ========================================================================== */

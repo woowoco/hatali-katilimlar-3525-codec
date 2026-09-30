@@ -81,18 +81,40 @@ export function FirmOverrideMini({
   }, [accountEuId]);
 
   const handleAdd = async () => {
-    const kw = draftKw.trim();
-    if (!kw) return;
-    const next: KeywordOverride = {
-      id: `ov-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      accountName,
-      acntEuId: accountEuId,
-      keywords: [kw],
-      matchMode: "contains",
-    };
+    const kws = draftKw
+      .split(/[,;\n\r]+/)
+      .map((k) => k.trim())
+      .filter(Boolean);
+    if (kws.length === 0) return;
     const all = await loadOverrides();
-    all.push(next);
-    await saveOverrides(all);
+    // Try to fold the new keywords into this firm's first existing rule
+    // (same firm, same default matchMode). If the firm has no rule yet,
+    // create one carrying every keyword. This is the operator-facing
+    // fix for "tek tek kayıt açmak yorucu" — a comma-separated paste
+    // here lands as one rule, not N.
+    const existingForFirm = all.filter((r) => (r.acntEuId ?? null) === accountEuId);
+    const seed = existingForFirm[0];
+    const existingKw = new Set(
+      seed ? seed.keywords.map((k) => k.trim().toLowerCase()) : [],
+    );
+    const additions = kws.filter((k) => !existingKw.has(k.trim().toLowerCase()));
+    if (seed && additions.length > 0) {
+      const nextRule: KeywordOverride = {
+        ...seed,
+        keywords: [...seed.keywords, ...additions],
+      };
+      const next = all.map((r) => (r.id === seed.id ? nextRule : r));
+      await saveOverrides(next);
+    } else if (!seed) {
+      const fresh: KeywordOverride = {
+        id: `ov-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        accountName,
+        acntEuId: accountEuId,
+        keywords: kws,
+        matchMode: "contains",
+      };
+      await saveOverrides([...all, fresh]);
+    }
     setDraftKw("");
     // No setRev here — the subscription fires on storage write and
     // re-applies the filtered list.
@@ -152,7 +174,7 @@ export function FirmOverrideMini({
           value={draftKw}
           onChange={(e) => setDraftKw(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder={`keyword ekle (örn. ${accountName.slice(0, 12).toLowerCase()})`}
+          placeholder={`keyword ekle — birden fazlaysa virgülle ayır (örn. ${accountName.slice(0, 12).toLowerCase()}, evet, iptal)`}
           spellCheck={false}
         />
         <button

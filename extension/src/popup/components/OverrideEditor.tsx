@@ -1,6 +1,22 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Plus, Trash2, Save, FileText, AlertCircle, Download, Upload, FlaskConical, Search } from "lucide-react";
-import { loadOverrides, saveOverrides, subscribeStorageKey, OVERRIDES_KEY_V2 } from "../../lib/store.js";
+import {
+  Plus,
+  Trash2,
+  Save,
+  FileText,
+  AlertCircle,
+  Download,
+  Upload,
+  FlaskConical,
+  Search,
+  X as XIcon,
+} from "lucide-react";
+import {
+  loadOverrides,
+  saveOverrides,
+  subscribeStorageKey,
+  OVERRIDES_KEY_V2,
+} from "../../lib/store.js";
 import {
   parseOverrideBulk,
   previewOverrideBulk,
@@ -13,7 +29,14 @@ import {
   formatImportSummary,
   triggerDownload,
 } from "../../lib/overrideExport.js";
-import { computeRuleUsage, type RuleUsageStat } from "../../lib/overrideMatcher.js";
+import {
+  computeRuleUsage,
+  groupRulesByFirmAndMode,
+  computeFirmGroupUsage,
+  type FirmGroup,
+  type RuleUsageStat,
+  type FirmGroupUsage,
+} from "../../lib/overrideMatcher.js";
 import { useToast } from "./Toast.js";
 import type {
   Customer,
@@ -28,15 +51,26 @@ import type {
  * charge to this firm." Persisted in chrome.storage.local under
  * "overrides.v2" (envelope `{ version: 2, rules: [...] }`).
  *
- * Bulk entry formats (both still supported):
+ * **Bulk entry formats (both still supported):**
  *   1. JSON envelope (preferred) — file picker or paste. See
  *      `docs/OVERRIDES-JSON-FORMAT.md`.
  *   2. Legacy pipe / TSV / Excel paste (still works for operators
- *      who already have sheets). New rules should go through JSON.
+ *      who already have sheets).
  *
- * Cross-component sync: a `subscribeStorageKey(OVERRIDES_KEY_V2, …)`
+ * **View: firm-grouped cards.** Rules are bucketed by
+ * `(accountName, matchMode)` so one firm = one card, regardless of how
+ * many keyword entries live in that rule's `keywords` array. Operators
+ * add keywords as chips inside the card instead of opening a fresh rule
+ * per keyword — the operator-facing fix for the "tek tek kayıt açmak
+ * yorucu" complaint. The underlying data model is still a flat
+ * `KeywordOverride[]` (unchanged from the JSON refactor).
+ *
+ * **Cross-component sync:** a `subscribeStorageKey(OVERRIDES_KEY_V2, …)`
  * listener replaces the previous one-shot load. Now /review and
  * /analyze see rule edits immediately.
+ *
+ * Safety: this component NEVER calls `chargeOnce`. It only persists
+ * operator-typed rules.
  */
 export function OverrideEditor({
   customers,
@@ -87,18 +121,21 @@ export function OverrideEditor({
   );
   const previewActive = bulkText.trim().length > 0;
 
+  // ----- Group rules by (firm, mode) for card rendering -------------------
+  const allGroups = useMemo(() => groupRulesByFirmAndMode(list), [list]);
+
   // ----- Search / filter (F2) ---------------------------------------------
   const [search, setSearch] = useState("");
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    if (!q) return list;
-    return list.filter((r) => {
-      if (r.accountName.toLowerCase().includes(q)) return true;
-      if (r.keywords.some((k) => k.toLowerCase().includes(q))) return true;
-      if ((r.notes ?? "").toLowerCase().includes(q)) return true;
+    if (!q) return allGroups;
+    return allGroups.filter((g) => {
+      if (g.displayName.toLowerCase().includes(q)) return true;
+      if (g.rules.some((r) => r.keywords.some((k) => k.toLowerCase().includes(q)))) return true;
+      if (g.rules.some((r) => (r.notes ?? "").toLowerCase().includes(q))) return true;
       return false;
     });
-  }, [list, search]);
+  }, [allGroups, search]);
 
   // ----- Duplicate detection (F3) — debounced ----------------------------
   const [dupWarnings, setDupWarnings] = useState<
@@ -122,7 +159,11 @@ export function OverrideEditor({
 
   // ----- Dry-run (F1) -----------------------------------------------------
   const [showDryRun, setShowDryRun] = useState(false);
-  const usage: RuleUsageStat[] = useMemo(() => {
+  const usageByGroup = useMemo<FirmGroupUsage[]>(() => {
+    if (!items || items.length === 0) return [];
+    return computeFirmGroupUsage(allGroups, items, 5);
+  }, [allGroups, items]);
+  const ruleUsage: RuleUsageStat[] = useMemo(() => {
     if (!items || items.length === 0) return [];
     return computeRuleUsage(list, items, 5);
   }, [list, items]);
@@ -135,11 +176,14 @@ export function OverrideEditor({
     await saveOverrides(next);
   };
 
-  const addRule = () => {
+  // ----- Firm-card mutations --------------------------------------------
+
+  /** Add a new empty rule. Lands in its own group card. */
+  const addEmptyRule = () => {
     setList((cur) => [
       ...cur,
       {
-        id: `ov-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        id: makeRuleId(),
         accountName: "",
         acntEuId: null,
         keywords: [],
@@ -150,35 +194,112 @@ export function OverrideEditor({
     setDirty(true);
   };
 
-  const removeRule = (id: string) => {
-    setList((cur) => cur.filter((o) => o.id !== id));
+  /** Remove every rule that targets the group's firm+mode pair. */
+  const removeGroup = (group: FirmGroup) => {
+    const ids = new Set(group.rules.map((r) => r.id));
+    setList((cur) => cur.filter((r) => !ids.has(r.id)));
     setDirty(true);
   };
 
-  const updateRule = (id: string, patch: Partial<KeywordOverride>) => {
+  /** Append a keyword (or several, comma-/semicolon-/newline-split) to
+   * the group's first rule. If the group is empty (just-created card),
+   * spawn a new rule with the keyword so the operator doesn't have to
+   * press "+ keyword ekle" twice. */
+  const addKeywordsToGroup = (group: FirmGroup, raw: string) => {
+    const keywords = splitKeywords(raw);
+    if (keywords.length === 0) return;
+    setList((cur) => {
+      // Locate the group's rules inside the latest list (cur may have
+      // evolved since the group was computed via useMemo).
+      const ids = new Set(group.rules.map((r) => r.id));
+      const fresh = cur.filter((r) => ids.has(r.id));
+      if (fresh.length === 0) {
+        // Group was empty (no rules yet) — spawn one with the keyword(s).
+        const seed = group.rules[0];
+        const newRule: KeywordOverride = {
+          id: makeRuleId(),
+          accountName: seed?.accountName ?? "",
+          acntEuId: seed?.acntEuId ?? null,
+          keywords,
+          matchMode: group.matchMode,
+          notes: seed?.notes ?? "",
+        };
+        return [...cur, newRule];
+      }
+      // Append every keyword to the first rule in the group; ignore
+      // intra-rule duplicates (case-insensitive).
+      const target = fresh[0];
+      const existing = new Set(
+        target.keywords.map((k) => k.trim().toLowerCase()),
+      );
+      const additions = keywords.filter(
+        (k) => !existing.has(k.trim().toLowerCase()),
+      );
+      if (additions.length === 0) return cur;
+      return cur.map((r) =>
+        r.id === target.id
+          ? { ...r, keywords: [...r.keywords, ...additions] }
+          : r,
+      );
+    });
+    setDirty(true);
+  };
+
+  /** Remove a single keyword chip from a rule. If the rule becomes
+   * empty, drop the rule entirely so it doesn't linger as a "no
+   * keywords" zombie. */
+  const removeKeyword = (ruleId: string, keyword: string) => {
     setList((cur) =>
-      cur.map((o) => {
-        if (o.id !== id) return o;
-        const next = { ...o, ...patch };
-        // Re-resolve acntEuId against the current customer list whenever
-        // accountName changes (best-effort case-insensitive match).
-        if (patch.accountName !== undefined) {
-          const norm = (s: string) => s.trim().toLowerCase();
-          const hit = customers.find((c) => norm(c.name) === norm(next.accountName));
-          next.acntEuId = hit?.acntEuId ?? null;
-        }
-        return next;
-      }),
+      cur
+        .map((r) =>
+          r.id === ruleId
+            ? {
+                ...r,
+                keywords: r.keywords.filter(
+                  (k) => k.trim().toLowerCase() !== keyword.trim().toLowerCase(),
+                ),
+              }
+            : r,
+        )
+        .filter((r) => r.keywords.length > 0),
     );
     setDirty(true);
   };
 
-  const updateKeywordsText = (id: string, text: string) => {
-    const keywords = text
-      .split(",")
-      .map((k) => k.trim())
-      .filter(Boolean);
-    updateRule(id, { keywords });
+  /** Rename the firm on every rule in the group + re-resolve acntEuId
+   * against the customer list. */
+  const renameGroup = (group: FirmGroup, newName: string) => {
+    const norm = (s: string) => s.trim().toLowerCase();
+    const hit = customers.find((c) => norm(c.name) === norm(newName));
+    setList((cur) =>
+      cur.map((r) =>
+        group.rules.some((g) => g.id === r.id)
+          ? { ...r, accountName: newName, acntEuId: hit?.acntEuId ?? null }
+          : r,
+      ),
+    );
+    setDirty(true);
+  };
+
+  /** Switch the matchMode on every rule in the group. */
+  const setGroupMode = (group: FirmGroup, newMode: OverrideMatchMode) => {
+    setList((cur) =>
+      cur.map((r) =>
+        group.rules.some((g) => g.id === r.id) ? { ...r, matchMode: newMode } : r,
+      ),
+    );
+    setDirty(true);
+  };
+
+  /** Sync notes across every rule in the group (kept equal so the card
+   * only shows one notes input). */
+  const setGroupNotes = (group: FirmGroup, newNotes: string) => {
+    setList((cur) =>
+      cur.map((r) =>
+        group.rules.some((g) => g.id === r.id) ? { ...r, notes: newNotes } : r,
+      ),
+    );
+    setDirty(true);
   };
 
   // ----- Bulk-paste handler (legacy) -------------------------------------
@@ -273,7 +394,7 @@ export function OverrideEditor({
       <div className="override-editor__head">
         <h3 style={{ margin: 0 }}>Özel Yönlendirme Kuralları</h3>
         <span className="muted" style={{ fontSize: 11 }}>
-          {list.length} kural · {totalKeywords} anahtar kelime
+          {allGroups.length} firma · {list.length} kural · {totalKeywords} anahtar kelime
         </span>
         <span style={{ flex: 1 }} />
         <button
@@ -299,9 +420,10 @@ export function OverrideEditor({
         />
       </div>
       <p className="muted" style={{ fontSize: 11, marginTop: 4 }}>
-        Model bu kurallara <em>her zaman</em> uyar. Özel anahtar kelimeler
-        (örn. "PTT", "aktifbank") için firma ataması yapmak istediğinde buraya
-        ekle.
+        Model bu kurallara <em>her zaman</em> uyar. Her firma tek bir
+        karttır; aynı firmaya birden fazla keyword eklemek için kartın
+        içindeki input'a virgülle ayrılmış şekilde yazıp{" "}
+        <kbd>Enter</kbd>'a bas.
       </p>
 
       {/* F2: search filter + F3: dup detection */}
@@ -329,7 +451,7 @@ export function OverrideEditor({
         </div>
         {search && (
           <span className="muted" style={{ fontSize: 11, alignSelf: "center" }}>
-            {filtered.length} / {list.length} kural
+            {filtered.length} / {allGroups.length} firma
           </span>
         )}
       </div>
@@ -337,7 +459,7 @@ export function OverrideEditor({
       {dupWarnings.length > 0 && (
         <div className="override-editor__dupwarn">
           <AlertCircle size={11} style={{ verticalAlign: "middle" }} />{" "}
-          {dupWarnings.length} çakışma var — aşağıdaki vurgulanan satırları kontrol et.
+          {dupWarnings.length} çakışma var — aşağıdaki vurgulanan kartları kontrol et.
         </div>
       )}
 
@@ -437,119 +559,34 @@ export function OverrideEditor({
       </details>
 
       <div className="override-editor__rows">
-        {list.length === 0 && (
+        {allGroups.length === 0 && (
           <div className="muted" style={{ fontSize: 11, padding: 12 }}>
-            Henüz kural yok. Aşağıdaki "Kural ekle" butonuyla başla.
+            Henüz kural yok. Aşağıdaki "Yeni kural" butonuyla başla.
           </div>
         )}
-        {filtered.map((o) => {
-          const norm = (s: string) => s.trim().toLowerCase();
-          const firmKnown = !!customers.find((c) => norm(c.name) === norm(o.accountName));
-          const dups = dupByRuleId.get(o.id) ?? [];
-          const hasDup = dups.length > 0;
-          const stat = usage.find((s) => s.ruleId === o.id);
-          return (
-            <div
-              key={o.id}
-              className={`override-row${o.matchMode === "exact" ? " override-row--exact" : ""}${hasDup ? " override-row--dup" : ""}`}
-              data-rule-id={o.id}
-            >
-              <div className="override-row__top">
-                <input
-                  type="text"
-                  placeholder="Firma adı (örn. Aktif Bank)"
-                  value={o.accountName}
-                  onChange={(e) => updateRule(o.id, { accountName: e.target.value })}
-                  className="override-row__firm"
-                  list="customer-list"
-                />
-                <datalist id="customer-list">
-                  {customers.map((c) => (
-                    <option key={c.acntEuId} value={c.name} />
-                  ))}
-                </datalist>
-                <span
-                  className={`pill ${firmKnown ? "success" : "warn"}`}
-                  title={
-                    firmKnown
-                      ? "Firma müşteri listesinde bulundu — kural ücretlendirilebilir"
-                      : "Firma müşteri listesinde yok — kural modele gider ama chargeOnce throw eder (acntEuId boş)"
-                  }
-                >
-                  {firmKnown ? "✓ listede" : "⚠ listede yok"}
-                </span>
-                {/* F4: usage stats next to each rule */}
-                {stat && stat.matchCount > 0 && (
-                  <span
-                    className="pill"
-                    title={`Bu kural, mevcut ${items?.length ?? 0} öğeden ${stat.matchCount} tanesinde eşleşiyor. Örnek txId'ler: ${stat.sampleTransactionIds.join(", ")}`}
-                  >
-                    {stat.matchCount}× eşleşme
-                  </span>
-                )}
-                <button
-                  className="ghost"
-                  onClick={() => removeRule(o.id)}
-                  title="Kuralı sil"
-                >
-                  <Trash2 size={11} />
-                </button>
-              </div>
-              <input
-                type="text"
-                placeholder="keyword1, keyword2, … (virgülle ayrılmış)"
-                value={o.keywords.join(", ")}
-                onChange={(e) => updateKeywordsText(o.id, e.target.value)}
-                className="override-row__kw"
-                spellCheck={false}
-              />
-              <div className="override-row__meta">
-                <select
-                  value={o.matchMode ?? "contains"}
-                  onChange={(e) =>
-                    updateRule(o.id, { matchMode: e.target.value as OverrideMatchMode })
-                  }
-                  className="override-row__mode"
-                  title="Eşleşme modu"
-                >
-                  <option value="contains">İçerir (substring)</option>
-                  <option value="exact">Tam eşleşme (==)</option>
-                </select>
-                <input
-                  type="text"
-                  placeholder="Not (opsiyonel)"
-                  value={o.notes ?? ""}
-                  onChange={(e) => updateRule(o.id, { notes: e.target.value })}
-                  className="override-row__notes"
-                />
-              </div>
-              {hasDup && (
-                <div className="override-row__warn">
-                  <AlertCircle size={10} style={{ verticalAlign: "middle" }} />{" "}
-                  {dups.map((d) => d.reason).join(" · ")}
-                </div>
-              )}
-              {!firmKnown && o.accountName.trim() && (
-                <div className="override-row__warn">
-                  <AlertCircle size={10} style={{ verticalAlign: "middle" }} />{" "}
-                  "<b>{o.accountName}</b>" müşteri listesinde yok. Bu kural
-                  <b> yine de modele gider</b> — AI, eşleşen keyword'leri
-                  bu adı kullanarak etiketler; fakat fiili ücretlendirme
-                  için <code>acntEuId</code> çözümlenemediğinden
-                  <b> <code>chargeOnce</code> throw eder</b> ve İncele
-                  ekranında bu satır <em>seçilemez</em>. Adı, listedeki bir
-                  firmayla birebir eşleşecek şekilde düzeltin (büyük-küçük
-                  harf ve boşluklar göz ardı edilir).
-                </div>
-              )}
-            </div>
-          );
-        })}
+        {filtered.map((g) => (
+          <FirmRuleCard
+            key={`${g.firmKey}::${g.matchMode}`}
+            group={g}
+            customers={customers}
+            dupByRuleId={dupByRuleId}
+            groupUsage={usageByGroup.find(
+              (u) => u.groupFirmKey === g.firmKey && u.groupMatchMode === g.matchMode,
+            )}
+            itemCount={items?.length ?? 0}
+            onAddKeywords={(raw) => addKeywordsToGroup(g, raw)}
+            onRemoveKeyword={removeKeyword}
+            onRename={(name) => renameGroup(g, name)}
+            onSetMode={(mode) => setGroupMode(g, mode)}
+            onSetNotes={(notes) => setGroupNotes(g, notes)}
+            onRemoveGroup={() => removeGroup(g)}
+          />
+        ))}
       </div>
 
       <div className="row" style={{ marginTop: 10, gap: 8, flexWrap: "wrap" }}>
-        <button onClick={addRule}>
-          <Plus size={11} /> Kural ekle
+        <button onClick={addEmptyRule}>
+          <Plus size={11} /> Yeni kural
         </button>
         <button
           className="primary"
@@ -585,13 +622,13 @@ export function OverrideEditor({
           <div className="muted" style={{ fontSize: 10, marginBottom: 4 }}>
             Her kural, yüklü <b>{items.length}</b> öğede kaç kez eşleşiyor:
           </div>
-          {usage.length === 0 || usage.every((u) => u.matchCount === 0) ? (
+          {ruleUsage.length === 0 || ruleUsage.every((u) => u.matchCount === 0) ? (
             <div className="muted" style={{ fontSize: 11, padding: 8 }}>
               Hiçbir kural mevcut öğelerde eşleşmiyor.
             </div>
           ) : (
             <ul style={{ margin: 0, padding: "0 0 0 16px", fontSize: 11 }}>
-              {usage
+              {ruleUsage
                 .filter((u) => u.matchCount > 0)
                 .map((u) => {
                   const r = list.find((x) => x.id === u.ruleId);
@@ -620,6 +657,228 @@ export function OverrideEditor({
   );
 }
 
+// --- Firm card ----------------------------------------------------------
+
+interface FirmRuleCardProps {
+  group: FirmGroup;
+  customers: Customer[];
+  /** Per-rule duplicate warnings, keyed by ruleId. */
+  dupByRuleId: Map<
+    string,
+    Array<{ ruleId: string; reason: string; partnerRuleId?: string }>
+  >;
+  /** Optional per-group aggregate match stats (only when items loaded). */
+  groupUsage?: FirmGroupUsage;
+  /** Items count for the tooltip on the usage pill. */
+  itemCount: number;
+  onAddKeywords: (raw: string) => void;
+  onRemoveKeyword: (ruleId: string, keyword: string) => void;
+  onRename: (newName: string) => void;
+  onSetMode: (mode: OverrideMatchMode) => void;
+  onSetNotes: (notes: string) => void;
+  onRemoveGroup: () => void;
+}
+
+/**
+ * One firm = one card. Header exposes the firm picker (with customer-
+ * list datalist), match mode, notes, and the delete button. The body
+ * lists every keyword from every rule in the group as removable chips;
+ * the input at the bottom appends new chips to the first rule in the
+ * group (or spawns a fresh rule if the card is brand-new and empty).
+ *
+ * The whole card is intentionally a single visual unit so the
+ * operator's mental model is "one firm = one rule, with many
+ * keywords" — fixing the previous "tek tek kayıt açmak yorucu"
+ * complaint.
+ */
+function FirmRuleCard({
+  group,
+  customers,
+  dupByRuleId,
+  groupUsage,
+  itemCount,
+  onAddKeywords,
+  onRemoveKeyword,
+  onRename,
+  onSetMode,
+  onSetNotes,
+  onRemoveGroup,
+}: FirmRuleCardProps) {
+  const norm = (s: string) => s.trim().toLowerCase();
+  const firmName = group.displayName;
+  const firmKnown = !!customers.find((c) => norm(c.name) === norm(firmName));
+  // Surface duplicate warnings for any rule in this group (most
+  // operators see a dup once per chip — we don't drown them).
+  const groupDups = group.rules.flatMap((r) => dupByRuleId.get(r.id) ?? []);
+  const hasDup = groupDups.length > 0;
+
+  // Stable input ref so Enter-to-save works without re-rendering.
+  const draftRef = useRef<HTMLInputElement>(null);
+  const [draft, setDraft] = useState("");
+
+  const handleAdd = () => {
+    const trimmed = draft.trim();
+    if (!trimmed) return;
+    onAddKeywords(trimmed);
+    setDraft("");
+  };
+
+  const handleKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleAdd();
+    } else if (e.key === "Escape") {
+      setDraft("");
+    }
+  };
+
+  // Aggregate every chip across all rules in this group so the
+  // operator sees one chip list per firm. We track (ruleId, keyword)
+  // so removal targets the right rule when a firm ever has multiple
+  // rules in the group (rare but possible after bulk imports).
+  const chips: Array<{ ruleId: string; keyword: string }> = [];
+  const seen = new Set<string>();
+  for (const r of group.rules) {
+    for (const kw of r.keywords) {
+      const key = `${r.id}::${kw}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      chips.push({ ruleId: r.id, keyword: kw });
+    }
+  }
+
+  return (
+    <div
+      className={`firm-rule-card${group.matchMode === "exact" ? " firm-rule-card--exact" : ""}${hasDup ? " firm-rule-card--dup" : ""}`}
+      data-firm-key={group.firmKey}
+      data-match-mode={group.matchMode}
+    >
+      <div className="firm-rule-card__top">
+        <input
+          type="text"
+          placeholder="Firma adı (örn. Aktif Bank)"
+          value={firmName}
+          onChange={(e) => onRename(e.target.value)}
+          className="firm-rule-card__firm"
+          list="customer-list"
+        />
+        <datalist id="customer-list">
+          {customers.map((c) => (
+            <option key={c.acntEuId} value={c.name} />
+          ))}
+        </datalist>
+        <select
+          value={group.matchMode}
+          onChange={(e) => onSetMode(e.target.value as OverrideMatchMode)}
+          className="firm-rule-card__mode"
+          title="Eşleşme modu"
+        >
+          <option value="contains">İçerir (substring)</option>
+          <option value="exact">Tam eşleşme (==)</option>
+        </select>
+        <span
+          className={`pill ${firmKnown ? "success" : "warn"}`}
+          title={
+            firmKnown
+              ? "Firma müşteri listesinde bulundu — kural ücretlendirilebilir"
+              : "Firma müşteri listesinde yok — kural modele gider ama chargeOnce throw eder (acntEuId boş)"
+          }
+        >
+          {firmKnown ? "✓ listede" : "⚠ listede yok"}
+        </span>
+        {groupUsage && groupUsage.totalMatchCount > 0 && (
+          <span
+            className="pill"
+            title={`Bu karttaki kurallar, mevcut ${itemCount} öğeden ${groupUsage.totalMatchCount} tanesinde eşleşiyor. Örnek txId'ler: ${groupUsage.sampleTransactionIds.join(", ")}`}
+          >
+            {groupUsage.totalMatchCount}× eşleşme
+          </span>
+        )}
+        <span style={{ flex: 1 }} />
+        <button
+          className="ghost"
+          onClick={onRemoveGroup}
+          title="Bu firmanın tüm kurallarını sil"
+          aria-label="Firmanın tüm kurallarını sil"
+        >
+          <Trash2 size={11} />
+        </button>
+      </div>
+
+      <div className="firm-rule-card__chips">
+        {chips.length === 0 && (
+          <span className="muted" style={{ fontSize: 11 }}>
+            (henüz anahtar kelime yok — aşağıdan ekle)
+          </span>
+        )}
+        {chips.map(({ ruleId, keyword }) => (
+          <span key={`${ruleId}::${keyword}`} className="chip">
+            <span className="chip__label">{keyword}</span>
+            <button
+              className="chip__x"
+              onClick={() => onRemoveKeyword(ruleId, keyword)}
+              title="Bu anahtar kelimeyi kaldır"
+              aria-label="Anahtar kelimeyi kaldır"
+            >
+              <XIcon size={9} />
+            </button>
+          </span>
+        ))}
+      </div>
+
+      <div className="firm-rule-card__add">
+        <input
+          ref={draftRef}
+          type="text"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={handleKey}
+          placeholder={`keyword ekle — birden fazlaysa virgülle ayır (örn. EVET, iptal, kredi)`}
+          spellCheck={false}
+        />
+        <button
+          className="ghost sm"
+          onClick={handleAdd}
+          disabled={!draft.trim()}
+          title="Bu firmaya yeni anahtar kelime ekle"
+        >
+          <Plus size={10} /> Ekle
+        </button>
+      </div>
+
+      <div className="firm-rule-card__meta">
+        <input
+          type="text"
+          placeholder="Not (opsiyonel)"
+          value={group.rules[0]?.notes ?? ""}
+          onChange={(e) => onSetNotes(e.target.value)}
+          className="firm-rule-card__notes"
+        />
+      </div>
+
+      {hasDup && (
+        <div className="firm-rule-card__warn">
+          <AlertCircle size={10} style={{ verticalAlign: "middle" }} />{" "}
+          {groupDups.map((d) => d.reason).join(" · ")}
+        </div>
+      )}
+      {!firmKnown && firmName.trim() && (
+        <div className="firm-rule-card__warn">
+          <AlertCircle size={10} style={{ verticalAlign: "middle" }} />{" "}
+          "<b>{firmName}</b>" müşteri listesinde yok. Bu kural
+          <b> yine de modele gider</b> — AI, eşleşen keyword'leri
+          bu adı kullanarak etiketler; fakat fiili ücretlendirme
+          için <code>acntEuId</code> çözümlenemediğinden
+          <b> <code>chargeOnce</code> throw eder</b> ve İncele
+          ekranında bu satır <em>seçilemez</em>. Adı, listedeki bir
+          firmayla birebir eşleşecek şekilde düzeltin (büyük-küçük
+          harf ve boşluklar göz ardı edilir).
+        </div>
+      )}
+    </div>
+  );
+}
+
 // --- helpers ---------------------------------------------------------------
 
 function unwrapV2(raw: unknown): KeywordOverride[] {
@@ -631,6 +890,27 @@ function unwrapV2(raw: unknown): KeywordOverride[] {
   // back gracefully.
   if (Array.isArray(raw)) return raw as KeywordOverride[];
   return [];
+}
+
+/**
+ * Generate a stable-enough rule id. Time prefix + random suffix is
+ * collision-resistant for human-scale rule lists.
+ */
+function makeRuleId(): string {
+  return `ov-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+}
+
+/**
+ * Accept a free-form keyword blob and split it into individual
+ * keywords. Operators paste things like "EVET, iptal, kredi" or "EVET;
+ * iptal\nkredi" — we treat comma, semicolon, and newline as
+ * equivalent separators.
+ */
+function splitKeywords(raw: string): string[] {
+  return raw
+    .split(/[,;\n\r]+/)
+    .map((k) => k.trim())
+    .filter(Boolean);
 }
 
 /**

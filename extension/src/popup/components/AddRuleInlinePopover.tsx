@@ -111,22 +111,51 @@ export function AddRuleInlinePopover({
 
   const save = async () => {
     if (saving) return;
-    const kw = keyword.trim();
+    // Accept comma/semicolon/newline-separated keyword paste — operators
+    // sometimes type "EVET, kredi, onay" rather than three separate rules.
+    const kws = keyword
+      .split(/[,;\n\r]+/)
+      .map((k) => k.trim())
+      .filter(Boolean);
+    if (kws.length === 0) return;
     const firm = firmIdx >= 0 ? customers[firmIdx] : null;
-    if (!kw) return;
     if (!firm) return;
     setSaving(true);
     try {
-      const rule: KeywordOverride = {
-        id: `ov-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        accountName: firm.name,
-        acntEuId: firm.acntEuId,
-        keywords: [kw],
-        matchMode,
-        notes: notes.trim() || undefined,
-      };
       const all = await loadOverrides();
-      all.push(rule);
+      // Fold into an existing rule for the same firm + same matchMode so
+      // "tek tek kayıt açmak yorucu" doesn't apply here either. If a
+      // same-firm rule already exists we extend its keywords; otherwise
+      // we create a new rule carrying every keyword.
+      const existingIdx = all.findIndex(
+        (r) =>
+          (r.acntEuId ?? null) === firm.acntEuId &&
+          (r.matchMode ?? "contains") === matchMode,
+      );
+      let rule: KeywordOverride;
+      if (existingIdx >= 0) {
+        const existing = all[existingIdx];
+        const seen = new Set(existing.keywords.map((k) => k.toLowerCase()));
+        const additions = kws.filter((k) => !seen.has(k.toLowerCase()));
+        if (additions.length === 0) {
+          // Nothing new to add — just close (idempotent).
+          onSaved?.(existing);
+          onClose?.();
+          return;
+        }
+        rule = { ...existing, keywords: [...existing.keywords, ...additions] };
+        all[existingIdx] = rule;
+      } else {
+        rule = {
+          id: `ov-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          accountName: firm.name,
+          acntEuId: firm.acntEuId,
+          keywords: kws,
+          matchMode,
+          notes: notes.trim() || undefined,
+        };
+        all.push(rule);
+      }
       await saveOverrides(all);
       onSaved?.(rule);
       onClose?.();
@@ -257,7 +286,7 @@ export function AddRuleInlinePopover({
             marginBottom: 6,
           }}
         >
-          Keyword
+          Keyword (virgülle ayrılmış birden fazla olabilir)
           <input
             type="text"
             value={keyword}
@@ -265,6 +294,7 @@ export function AddRuleInlinePopover({
             onKeyDown={handleKey}
             spellCheck={false}
             style={{ fontSize: 12 }}
+            placeholder="EVET, kredi, onay"
           />
         </label>
 

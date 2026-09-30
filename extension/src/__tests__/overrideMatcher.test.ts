@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { matchItem, firstMatch, computeRuleUsage } from "../lib/overrideMatcher.js";
+import {
+  matchItem,
+  firstMatch,
+  computeRuleUsage,
+  groupRulesByFirmAndMode,
+  computeFirmGroupUsage,
+} from "../lib/overrideMatcher.js";
 import type { KeywordOverride, UnmatchedItem } from "../types.js";
 
 function mkItem(over: Partial<UnmatchedItem> = {}): UnmatchedItem {
@@ -156,5 +162,127 @@ describe("computeRuleUsage", () => {
     const ruleB = mkRule({ id: "b", keywords: ["B"] });
     const stats = computeRuleUsage([ruleA, ruleB], []);
     expect(stats.map((s) => s.ruleId)).toEqual(["a", "b"]);
+  });
+});
+
+describe("groupRulesByFirmAndMode", () => {
+  it("buckets rules by (firmKey, matchMode) so one firm = one card", () => {
+    const rules: KeywordOverride[] = [
+      mkRule({ id: "r1", accountName: "Aktif Bank", keywords: ["EVET"] }),
+      mkRule({ id: "r2", accountName: "Aktif Bank", keywords: ["aktifbank"] }),
+      mkRule({ id: "r3", accountName: "Aktif Bank", keywords: ["PTT"] }),
+    ];
+    const groups = groupRulesByFirmAndMode(rules);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].firmKey).toBe("aktif bank");
+    expect(groups[0].matchMode).toBe("contains");
+    expect(groups[0].rules.map((r) => r.id)).toEqual(["r1", "r2", "r3"]);
+    // displayName comes from the first rule that joined the group.
+    expect(groups[0].displayName).toBe("Aktif Bank");
+  });
+
+  it("splits the same firm across contains and exact mode cards", () => {
+    const rules: KeywordOverride[] = [
+      mkRule({ id: "r1", accountName: "Aktif Bank", keywords: ["EVET"] }),
+      mkRule({
+        id: "r2",
+        accountName: "Aktif Bank",
+        keywords: ["iptal"],
+        matchMode: "exact",
+      }),
+    ];
+    const groups = groupRulesByFirmAndMode(rules);
+    expect(groups).toHaveLength(2);
+    expect(groups.map((g) => g.matchMode).sort()).toEqual(["contains", "exact"]);
+  });
+
+  it("splits rules whose firm names differ only in case", () => {
+    const rules: KeywordOverride[] = [
+      mkRule({ id: "r1", accountName: "Aktif Bank", keywords: ["EVET"] }),
+      mkRule({ id: "r2", accountName: "aktif bank", keywords: ["iptal"] }),
+    ];
+    const groups = groupRulesByFirmAndMode(rules);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].rules).toHaveLength(2);
+  });
+
+  it("separates rules by firm — two firms stay in two cards", () => {
+    const rules: KeywordOverride[] = [
+      mkRule({ id: "r1", accountName: "Aktif Bank", keywords: ["EVET"] }),
+      mkRule({ id: "r2", accountName: "Garanti", keywords: ["EVET"] }),
+    ];
+    const groups = groupRulesByFirmAndMode(rules);
+    expect(groups).toHaveLength(2);
+    expect(groups.map((g) => g.firmKey).sort()).toEqual([
+      "aktif bank",
+      "garanti",
+    ]);
+  });
+
+  it("uses (boş) as the firmKey when accountName is blank", () => {
+    const rules: KeywordOverride[] = [
+      mkRule({ id: "r1", accountName: "", keywords: ["EVET"] }),
+    ];
+    const groups = groupRulesByFirmAndMode(rules);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].firmKey).toBe("(boş)");
+    expect(groups[0].displayName).toBe("");
+  });
+
+  it("returns an empty array for an empty input", () => {
+    expect(groupRulesByFirmAndMode([])).toEqual([]);
+  });
+
+  it("sorts groups by firmKey, then by matchMode", () => {
+    const rules: KeywordOverride[] = [
+      mkRule({ id: "r1", accountName: "Ziraat", keywords: ["z"] }),
+      mkRule({
+        id: "r2",
+        accountName: "Aktif",
+        keywords: ["a"],
+        matchMode: "exact",
+      }),
+      mkRule({ id: "r3", accountName: "Aktif", keywords: ["b"] }),
+    ];
+    const groups = groupRulesByFirmAndMode(rules);
+    expect(groups.map((g) => `${g.firmKey}::${g.matchMode}`)).toEqual([
+      "aktif::contains",
+      "aktif::exact",
+      "ziraat::contains",
+    ]);
+  });
+});
+
+describe("computeFirmGroupUsage", () => {
+  it("sums per-rule match counts within a group", () => {
+    const rules: KeywordOverride[] = [
+      mkRule({ id: "r1", accountName: "Aktif", keywords: ["EVET"] }),
+      mkRule({ id: "r2", accountName: "Aktif", keywords: ["PTT"] }),
+    ];
+    const items: UnmatchedItem[] = [
+      mkItem({ transactionId: 1, keyword1: "EVET" }),
+      mkItem({ transactionId: 2, keyword2: "PTT" }),
+      mkItem({ transactionId: 3, keyword1: "PTT" }),
+      mkItem({ transactionId: 4, keyword1: "OTHER" }),
+    ];
+    const groups = groupRulesByFirmAndMode(rules);
+    const usage = computeFirmGroupUsage(groups, items, 5);
+    expect(usage).toHaveLength(1);
+    expect(usage[0].totalMatchCount).toBe(3);
+    expect(usage[0].sampleTransactionIds.sort()).toEqual([1, 2, 3]);
+    expect(usage[0].groupFirmKey).toBe("aktif");
+    expect(usage[0].groupMatchMode).toBe("contains");
+  });
+
+  it("emits a separate entry per group, even when nothing matches", () => {
+    const rules: KeywordOverride[] = [
+      mkRule({ id: "r1", accountName: "Aktif", keywords: ["EVET"] }),
+      mkRule({ id: "r2", accountName: "Garanti", keywords: ["iptal"] }),
+    ];
+    const groups = groupRulesByFirmAndMode(rules);
+    const usage = computeFirmGroupUsage(groups, [], 5);
+    expect(usage).toHaveLength(2);
+    expect(usage.every((u) => u.totalMatchCount === 0)).toBe(true);
+    expect(usage.every((u) => u.sampleTransactionIds.length === 0)).toBe(true);
   });
 });

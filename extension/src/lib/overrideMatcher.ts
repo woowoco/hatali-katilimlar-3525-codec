@@ -1,4 +1,4 @@
-import type { KeywordOverride, MatchField, UnmatchedItem } from "../types.js";
+import type { KeywordOverride, MatchField, OverrideMatchMode, UnmatchedItem } from "../types.js";
 
 /**
  * Result of matching a single item against the override list.
@@ -130,4 +130,102 @@ export function computeRuleUsage(
     stats.push({ ruleId: rule.id, matchCount: count, sampleTransactionIds: samples });
   }
   return stats;
+}
+
+/**
+ * One "firm card" in the editor — a single firm + matchMode pair, with
+ * every rule that targets that combination. Used by OverrideEditor to
+ * render one card per firm instead of one row per rule (the operator's
+ * main complaint: creating N keywords meant opening N separate rules).
+ *
+ * The data model is unchanged — this is a view layer helper. When the
+ * operator adds a keyword inside a card, it's appended to the first
+ * rule of that group (or a new rule is spawned if the group is empty);
+ * deleting a chip removes it from its parent rule, and an emptied rule
+ * drops out of the group.
+ */
+export interface FirmGroup {
+  /** Trimmed lower-cased firm name, or "boş" when accountName is blank. */
+  firmKey: string;
+  /** Display name taken from the first rule that joined the group. */
+  displayName: string;
+  matchMode: OverrideMatchMode;
+  /** All KeywordOverrides that target this firmKey + matchMode pair. */
+  rules: KeywordOverride[];
+}
+
+/**
+ * Bucket rules by `(firmKey, matchMode)`. The first rule to join a
+ * bucket wins the canonical `displayName`; later rules with the same
+ * firmKey but a slightly different casing get folded into the same
+ * bucket so the operator sees one card, not three. Returned in a
+ * stable order (Turkish locale, alphabetical firmKey + matchMode).
+ */
+export function groupRulesByFirmAndMode(
+  rules: KeywordOverride[],
+): FirmGroup[] {
+  const map = new Map<string, FirmGroup>();
+  for (const r of rules) {
+    const firmKey = (r.accountName ?? "").trim().toLowerCase() || "(boş)";
+    const mode: OverrideMatchMode = r.matchMode ?? "contains";
+    const key = `${firmKey}::${mode}`;
+    const g = map.get(key);
+    if (g) {
+      g.rules.push(r);
+    } else {
+      map.set(key, {
+        firmKey,
+        displayName: r.accountName || "",
+        matchMode: mode,
+        rules: [r],
+      });
+    }
+  }
+  return [...map.values()].sort((a, b) => {
+    if (a.firmKey !== b.firmKey) {
+      return a.firmKey.localeCompare(b.firmKey, "tr");
+    }
+    return a.matchMode === b.matchMode
+      ? 0
+      : a.matchMode.localeCompare(b.matchMode, "tr");
+  });
+}
+
+/**
+ * Aggregate per-group match counts by joining `computeRuleUsage` over
+ * every rule in the group. Used to render the "N × eşleşme" pill on a
+ * firm card when items are loaded. Cheap: each rule is matched against
+ * each item exactly once (no quadratic grouping).
+ */
+export interface FirmGroupUsage {
+  groupFirmKey: string;
+  groupMatchMode: OverrideMatchMode;
+  totalMatchCount: number;
+  sampleTransactionIds: number[];
+}
+
+export function computeFirmGroupUsage(
+  groups: FirmGroup[],
+  items: UnmatchedItem[],
+  cap = 5,
+): FirmGroupUsage[] {
+  const out: FirmGroupUsage[] = [];
+  for (const g of groups) {
+    const stats = computeRuleUsage(g.rules, items, cap);
+    let total = 0;
+    const samples: number[] = [];
+    for (const s of stats) {
+      total += s.matchCount;
+      for (const tx of s.sampleTransactionIds) {
+        if (samples.length < cap) samples.push(tx);
+      }
+    }
+    out.push({
+      groupFirmKey: g.firmKey,
+      groupMatchMode: g.matchMode,
+      totalMatchCount: total,
+      sampleTransactionIds: samples,
+    });
+  }
+  return out;
 }
