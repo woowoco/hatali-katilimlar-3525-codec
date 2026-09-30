@@ -36,6 +36,36 @@ Every match must be inside an `onClick` handler in a `<button>` (or
 appears anywhere else, **that change is unauthorized and must be
 reverted**.
 
+### Overrides are suggestions, not instructions
+
+The operator maintains a per-tx keyword → firm override list
+(`chrome.storage.local["overrides.v2"]`, see
+`docs/OVERRIDES-JSON-FORMAT.md`). When the AI categorizes, those
+rules are emitted as a fenced JSON block in the prompt
+(`ai-proxy/src/prompts.ts::buildOverrideFragment`). The block is
+framed as:
+
+> "These are SUGGESTIONS the operator reviews manually — the AI NEVER
+> auto-charges."
+
+The AI's job is to produce a `suggestedAccountEuId` for each item —
+the operator reviews every row in `/review` and clicks
+`Ücretlendir` to actually POST. **Adding rules to the override list
+must NEVER introduce a code path that calls `chargeOnce()` outside
+of the existing manual button onClick handlers.** The only
+write-capable surfaces are:
+
+- `extension/src/popup/components/OverrideEditor.tsx`
+  (bulk paste / JSON import / per-row edit) — writes
+  `overrides.v2` via `saveOverrides`.
+- `extension/src/popup/components/FirmOverrideMini.tsx`
+  (single-firm keyword add/remove) — same key.
+- `extension/src/popup/components/AddRuleInlinePopover.tsx`
+  (per-tx popover in /review) — same key.
+
+None of these call `chargeOnce`. The popover's only side effect is
+persisting a rule.
+
 ## Rule 2 — No automatic charging of any kind
 
 The Codec fallback row exists because HAR-confirmed unmatched items have

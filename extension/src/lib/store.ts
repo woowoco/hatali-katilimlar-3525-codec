@@ -13,7 +13,12 @@ import { DEFAULT_SETTINGS } from "../types.js";
 const SETTINGS_KEY = "settings.v1";
 const SESSION_KEY = "session.v1"; // session-scoped state: customers, items, matches
 const AUDIT_KEY = "audit.v1"; // history of every Charged POST sent
-const OVERRIDES_KEY = "overrides.v1"; // operator-maintained keyword → firm rules
+// v1 stores a bare KeywordOverride[] array. v2 stores an envelope
+// `{ version: 2, rules: KeywordOverride[] }`. See
+// `docs/OVERRIDES-JSON-FORMAT.md`. `loadOverrides`/`saveOverrides` keep
+// both shapes working transparently; new writes go to v2.
+const OVERRIDES_KEY_V1 = "overrides.v1";
+const OVERRIDES_KEY_V2 = "overrides.v2";
 
 export async function loadSettings(): Promise<Settings> {
   const raw = await chrome.storage.local.get(SETTINGS_KEY);
@@ -134,14 +139,83 @@ export async function clearAudit(): Promise<void> {
 
 // --- Keyword overrides ------------------------------------------------------
 
+/**
+ * Load the operator's keyword → firm override rules.
+ *
+ * Tries `overrides.v2` first (envelope `{ version: 2, rules }`). If
+ * missing, falls back to `overrides.v1` (bare `KeywordOverride[]`) and
+ * returns those values verbatim — the on-disk shape never changed for
+ * the rules themselves, only the wrapping. The next `saveOverrides`
+ * call will promote the data to v2.
+ *
+ * Returned list is always `KeywordOverride[]` regardless of which key
+ * was read; callers never need to know about the envelope.
+ */
 export async function loadOverrides(): Promise<KeywordOverride[]> {
-  const raw = await chrome.storage.local.get(OVERRIDES_KEY);
-  return Array.isArray(raw[OVERRIDES_KEY]) ? raw[OVERRIDES_KEY] : [];
+  const raw = await chrome.storage.local.get([OVERRIDES_KEY_V2, OVERRIDES_KEY_V1]);
+  const v2 = raw[OVERRIDES_KEY_V2] as
+    | { version?: number; rules?: unknown }
+    | undefined;
+  if (v2 && Array.isArray(v2.rules)) {
+    return v2.rules as KeywordOverride[];
+  }
+  const v1 = raw[OVERRIDES_KEY_V1];
+  return Array.isArray(v1) ? (v1 as KeywordOverride[]) : [];
 }
 
+/**
+ * Persist the operator's keyword → firm override rules under the
+ * current schema (`overrides.v2`, envelope `{ version: 2, rules }`).
+ * The legacy `overrides.v1` key is not touched — it remains in storage
+ * as orphan until Chrome's storage quota reclaim removes it.
+ */
 export async function saveOverrides(list: KeywordOverride[]): Promise<void> {
-  await chrome.storage.local.set({ [OVERRIDES_KEY]: list });
+  await chrome.storage.local.set({
+    [OVERRIDES_KEY_V2]: { version: 2, rules: list },
+  });
 }
+
+// --- Cross-component storage subscriptions ---------------------------------
+
+/**
+ * Subscribe to changes on a single `chrome.storage.local` key.
+ *
+ * The override rules list can be mutated from several UI surfaces
+ * (OverrideEditor in /fetch, FirmOverrideMini in /review, the new
+ * per-tx popover in /review). Without a shared listener, a rule added
+ * in /review would not show up in StepAnalyze until the operator
+ * navigated away and back. Wrapping `chrome.storage.onChanged` here
+ * gives every consumer a single, consistent hook to re-read after any
+ * write, regardless of which surface performed it.
+ *
+ * `cb` receives the new value typed as `T`, or `undefined` when the
+ * key was removed. The listener filters to `area === "local"` so it
+ * does not collide with `chrome.storage.sync` / `chrome.storage.session`
+ * if a future feature introduces them.
+ *
+ * Returns an unsubscribe function — callers should invoke it from a
+ * `useEffect` cleanup to avoid stale listeners on hot-reload.
+ */
+export function subscribeStorageKey<T>(
+  key: string,
+  cb: (newValue: T | undefined) => void,
+): () => void {
+  const listener = (
+    changes: Record<string, chrome.storage.StorageChange>,
+    area: chrome.storage.AreaName,
+  ) => {
+    if (area !== "local") return;
+    const ch = changes[key];
+    if (!ch) return;
+    cb(ch.newValue as T | undefined);
+  };
+  chrome.storage.onChanged.addListener(listener);
+  return () => chrome.storage.onChanged.removeListener(listener);
+}
+
+// Re-export the v2 key so consumers (and `subscribeStorageKey` callers)
+// subscribe to the same key the writer targets.
+export { OVERRIDES_KEY_V2 };
 
 // Re-export so consumers can import the type alongside the loader.
 type Customer = import("../types.js").Customer;

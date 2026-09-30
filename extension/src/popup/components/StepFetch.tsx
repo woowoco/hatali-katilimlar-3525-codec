@@ -148,7 +148,10 @@ export function StepFetch() {
             çekildiği için firma adları artık doğrudan eşleşir
             (aşağıdaki datalist'ten seçim yapabilirsin).
           </p>
-          <OverrideEditor customers={session.customers as Customer[]} />
+          <OverrideEditor
+            customers={session.customers as Customer[]}
+            items={session.items}
+          />
         </div>
       )}
     </div>

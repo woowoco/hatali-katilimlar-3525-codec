@@ -120,10 +120,18 @@ export function buildUserPrompt(
     "",
   ];
 
-  if (overrides.length > 0) {
+  // Filter out rules with no keywords here so the header count matches
+  // the rules actually rendered in the fenced block. Empty-keyword rules
+  // are bare firm names with no signals for the AI; including them in
+  // the header (without rendering) confuses the operator reviewing the
+  // prompt in the dev console.
+  const usableOverrides = overrides.filter((o) =>
+    o.keywords.some((k) => k.trim()),
+  );
+  if (usableOverrides.length > 0) {
     sections.push(
-      `=== OVERRIDES (${overrides.length}) — operator-maintained routing rules ===`,
-      buildOverrideFragment(overrides),
+      `=== OVERRIDES (${usableOverrides.length}) — operator-maintained routing rules ===`,
+      buildOverrideFragment(usableOverrides, customers),
       "",
     );
   }
@@ -139,48 +147,46 @@ export function buildUserPrompt(
 }
 
 /**
- * Render an override list as a prompt fragment the AI can follow.
- * Empty list → "". Caller skips injection when empty.
+ * Render the override list as a fenced JSON block the AI can follow.
+ * Empty list (or list whose every rule has empty keywords) → "" so the
+ * caller can skip injection entirely — matching the previous contract
+ * at `prompts.ts` `if (overrides.length > 0)` upstream.
  *
- * Format chosen to mirror the operator's own Excel/TSV paste:
+ * Wire format (see `docs/OVERRIDES-JSON-FORMAT.md` for rationale):
  *
- *     FİRMA        KEYWORD1   KEYWORD2   KEYWORD3   NOT                              MOD
- *     AKTIFBANK    EVET       ptt        kredi     Customer listesindeki AKTIFBANK   İçerir
- *     YKB          —          evet       —         Onay SMS'leri                     İçerir
+ *   ```json
+ *   { "rules": [ { accountName, acntEuId, keywords, matchMode, notes,
+ *                  resolvedFromCustomerList, warning? }, … ] }
+ *   ```
  *
- * Rendering rules (driven by the operator's feedback):
+ *   - `acntEuId` is emitted as the INTEGER INDEX from the customer
+ *     list passed to `buildUserPrompt` (1-based), or `null` when the
+ *     rule's UUID does not resolve. This mirrors the existing pattern
+ *     for `suggestedAccountEuId`: the LLM emits an integer index, the
+ *     proxy translates it back via `resolveCustomerIndexToEuId`. Rules
+ *     with `acntEuId === null` become suggestions with `null` and
+ *     land in the Codec fallback bucket in the extension UI.
+ *   - `warning` is set ONLY when the firm is missing from the customer
+ *     list. We do NOT bake the warning into `accountName` (the previous
+ *     " (müşteri listesinde yok)" suffix made the value dirty for
+ *     downstream prompt-output comparison).
+ *   - `resolvedFromCustomerList` is a flat boolean the LLM and our
+ *     regression tests can use without parsing prose.
+ *   - Rules whose `keywords` array is entirely empty are dropped
+ *     outright — matches the previous behaviour and prevents the AI
+ *     from seeing bare firm names as "always-route" rows.
  *
- *   - Empty KEYWORD columns (Keyword1/2/3) are OMITTED from the prompt
- *     entirely — we do NOT send `—` placeholders. The model is told
- *     "only the listed keywords are signals for this firm". This
- *     prevents a rule like "Firma=KW1 only" from confusing the AI
- *     into thinking KEYWORD2/3 are also triggers.
- *   - Empty MOD falls back to `İçerir` (default match mode).
- *   - Empty NOT is also omitted from the row, but the column header
- *     stays in place so the AI knows the column exists.
- *   - Firm column always carries the operator-typed accountName
- *     verbatim — this is the literal routing target.
- *   - If accountName didn't resolve to a customer (acntEuId === null)
- *     we annotate "(müşteri listesinde yok)" but still emit the row;
- *     the model will still suggest that name and the operator will
- *     see the firm-unknown warning in the UI.
- *   - Rules whose keywords array is entirely empty are dropped
- *     outright — they would just be a bare firm name.
- *
- * Each emitted rule carries `matchMode`:
- *   - "contains" (default): case-insensitive substring match against
- *     keyword1/keyword2/msgContent.
- *   - "exact": case-insensitive, character-for-character equality
- *     against the full value of keyword1 OR keyword2 OR msgContent
- *     (after trim). Use when the operator wants "keyword1 === 'EVET'"
- *     to route, not "EVET" appearing inside a longer string.
- *
- * CRITICAL CONTRACT: the AI does NOT charge anything. It only suggests
- * (suggestedAccountEuId / suggestedAccountName). The operator manually
- * reviews and clicks "Ücretlendir" in the extension UI. Override rules
- * only steer the suggestion; they never trigger a charge by themselves.
+ * CRITICAL CONTRACT (preserved verbatim from the previous text-format
+ * fragment): the AI NEVER auto-charges. It only emits
+ * `suggestedAccountEuId` / `suggestedAccountName` suggestions; the
+ * operator manually reviews and clicks "Ücretlendir". Override rules
+ * steer suggestions; they never trigger a charge by themselves. See
+ * `docs/SAFETY-CONTRACT.md` §1 — "AI is read-only".
  */
-function buildOverrideFragment(overrides: KeywordOverride[]): string {
+function buildOverrideFragment(
+  overrides: KeywordOverride[],
+  customers: Customer[],
+): string {
   // Drop rules with no keywords at all — they would just be a "FİRMA"
   // row with no signals for the AI.
   const usable = overrides.filter((o) =>
@@ -188,49 +194,75 @@ function buildOverrideFragment(overrides: KeywordOverride[]): string {
   );
   if (usable.length === 0) return "";
 
-  const lines: string[] = [
-    "OVERRIDE RULES — operator-maintained routing table.",
-    "Each row = FİRMA → KEYWORD1 → KEYWORD2 → KEYWORD3 → NOT → MOD.",
-    "A row's KEYWORD columns are the ONLY signals for that FİRMA. If an item's keyword1/keyword2/msgContent contains any KEYWORD (per MOD semantics), suggest that FİRMA — even if your own customer-list reasoning would route it elsewhere.",
-    "Empty KEYWORD columns are intentionally NOT emitted — treat the row as having only the listed keywords. Do not invent matches in unlisted columns.",
-    "These are SUGGESTIONS the operator reviews manually — you NEVER auto-charge.",
-    "",
-  ];
+  // Build the 1-based index → UUID lookup once. We use a case-
+  // insensitive name match because the operator-typed accountName may
+  // differ from the canonical customer name in whitespace/casing.
+  const norm = (s: string) => s.trim().toLowerCase();
+  const customerIndexByName = new Map<string, number>();
+  customers.forEach((c, i) => {
+    if (c.name) customerIndexByName.set(norm(c.name), i + 1);
+  });
 
-  for (const ov of usable) {
-    const kws = ov.keywords.map((k) => k.trim()).filter(Boolean);
-    const mode = ov.matchMode === "exact" ? "Tam" : "İçerir"; // empty → fallback
-    const acntSuffix = ov.acntEuId
-      ? ""
-      : " (müşteri listesinde yok — yine de öner, chargeOnce throw eder)";
-    const not = (ov.notes ?? "").trim();
-
-    // Build the row parts in order. Empty keyword columns are omitted
-    // (no "—" placeholder) so the AI doesn't get false-positive signals.
-    const parts: string[] = [`FİRMA: ${ov.accountName}${acntSuffix}`];
-    parts.push(`KEYWORD1: ${kws[0]}`);
-    if (kws[1]) parts.push(`KEYWORD2: ${kws[1]}`);
-    if (kws[2]) parts.push(`KEYWORD3: ${kws[2]}`);
-    if (kws.length > 3) {
-      // Edge case: operator pasted >3 keywords. Append the rest so
-      // nothing is lost — they go under KEYWORD3 with a separator.
-      parts.push(
-        `KEYWORD3+: ${kws.slice(2).join(" / ")}`,
-      );
+  const rules: Record<string, unknown>[] = usable.map((ov) => {
+    const idx = customerIndexByName.get(norm(ov.accountName));
+    const resolved = idx !== undefined;
+    // Resolve UUID → integer index only when the rule's stored UUID
+    // matches the canonical UUID we have on file for that customer.
+    // A null UUID on the rule side is fine (operator may have added
+    // the firm by name only); we still try the name match above.
+    let emittedEuId: number | null = null;
+    if (resolved && idx !== undefined) {
+      const canonical = customers[idx - 1]?.acntEuId;
+      if (ov.acntEuId == null || ov.acntEuId === "" || ov.acntEuId === canonical) {
+        emittedEuId = idx;
+      } else {
+        // UUID in storage doesn't match the customer's current UUID.
+        // Treat as "not in list" so the AI doesn't suggest a stale id.
+        emittedEuId = null;
+      }
     }
-    if (not) parts.push(`NOT: ${not}`);
-    parts.push(`MOD: ${mode}`);
+    const entry: Record<string, unknown> = {
+      accountName: ov.accountName,
+      acntEuId: emittedEuId,
+      keywords: ov.keywords.map((k) => k.trim()).filter(Boolean),
+      matchMode: ov.matchMode === "exact" ? "exact" : "contains",
+      notes: (ov.notes ?? "").trim(),
+      resolvedFromCustomerList: resolved && emittedEuId !== null,
+    };
+    if (!resolved || emittedEuId === null) {
+      entry.warning =
+        "müşteri listesinde yok — yine de öner, chargeOnce throw eder";
+    }
+    return entry;
+  });
 
-    lines.push(parts.join(" | "));
-  }
+  // Hand-roll the JSON output: stable key ordering, no `undefined`
+  // values, and 2-space indentation that matches the rest of the
+  // prompt's readability. `JSON.stringify` with a replacer handles
+  // the trailing-comma issue for omitted keys naturally.
+  const ruleJson = rules
+    .map((r) => JSON.stringify(r, null, 2).split("\n").map((l, i) => (i === 0 ? l : "  " + l)).join("\n"))
+    .join(",\n");
 
-  // Tail note about the mode semantics — needed once, not per row.
-  lines.push("");
-  lines.push(
-    "MOD semantics: 'İçerir' = case-insensitive substring match against keyword1/keyword2/msgContent; 'Tam' = whole-field equality after trim (case-insensitive).",
-  );
+  const header =
+    "These are SUGGESTIONS the operator reviews manually — the AI NEVER auto-charges.\n" +
+    "A rule's `keywords` are matched (per `matchMode`) against the LITERAL contents " +
+    "of an item's keyword1, keyword2, or msgContent fields. If matched, the AI must " +
+    "emit `suggestedAccountName` equal to the rule's `accountName` and " +
+    "`suggestedAccountEuId` equal to the integer INDEX of that firm in the customer " +
+    "list above (or `null` if `acntEuId === null`).\n";
 
-  return lines.join("\n");
+  const footer =
+    "\n`matchMode` semantics:\n" +
+    "  - \"contains\" — case-insensitive substring match against keyword1/keyword2/msgContent\n" +
+    "  - \"exact\"    — case-insensitive whole-field equality after trim (the entire\n" +
+    "                 value of the matched field must equal one of `keywords`)\n" +
+    "\n" +
+    "`acntEuId` field: the INTEGER INDEX from the customer list above (1-based),\n" +
+    "or `null` if the firm is not in the customer list. The proxy translates the\n" +
+    "integer back to the real UUID before charging.";
+
+  return header + "\n```json\n{\n  \"rules\": [\n" + ruleJson + "\n  ]\n}\n```\n" + footer;
 }
 
 function truncate(s: string, n: number): string {

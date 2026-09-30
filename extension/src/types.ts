@@ -104,6 +104,23 @@ export interface KeywordOverride {
   notes?: string;
 }
 
+/**
+ * Envelope written by `exportOverridesToJson` and parsed by
+ * `importOverridesFromJson`. See `docs/OVERRIDES-JSON-FORMAT.md`.
+ *
+ * The on-disk format embeds the version so future schema changes can
+ * migrate without losing user rules.
+ */
+export interface OverrideFileEnvelope {
+  /** Must equal `"hatali-katilimlar.overrides"`. Imports reject otherwise. */
+  format: "hatali-katilimlar.overrides";
+  /** 1 = legacy bare array auto-detected on import. 2 = current envelope. */
+  version: 1 | 2;
+  /** ISO-8601 timestamp of when this file was exported. Informational. */
+  exportedAt?: string;
+  rules: KeywordOverride[];
+}
+
 // --- Charged API ------------------------------------------------------------
 
 export interface ChargedResponse {

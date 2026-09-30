@@ -1,6 +1,11 @@
 import { useEffect, useState } from "react";
 import { Plus, X } from "lucide-react";
-import { loadOverrides, saveOverrides } from "../../lib/store.js";
+import {
+  loadOverrides,
+  saveOverrides,
+  subscribeStorageKey,
+  OVERRIDES_KEY_V2,
+} from "../../lib/store.js";
 import type { KeywordOverride } from "../../types.js";
 
 interface FirmOverrideMiniProps {
@@ -35,15 +40,15 @@ interface FirmOverrideMiniProps {
  *      inline UI small (one input + Ekle button) so it doesn't
  *      balloon the firm section visually.
  *
- * Persistence: chrome.storage.local["overrides.v1"]. The full
- * OverrideEditor (StepFetch) reads from the same key, so a rule
- * added here is immediately visible there and vice versa. We bump a
- * `revision` state to remount the rules list after each save so the
- * operator sees their addition without a page reload.
+ * Persistence: chrome.storage.local["overrides.v2"] (envelope). The
+ * full OverrideEditor (StepFetch) and AddRuleInlinePopover
+ * (also /review) write to the same key — a rule added anywhere shows
+ * up here via `subscribeStorageKey` and vice versa. No more `rev`
+ * counter hack to remount on save.
  *
  * Hard rule: this component NEVER calls `chargeOnce`. It only
  * persists operator-typed rules; charge is gated to the
- * `Seçili (N) Ücretlendir` button onClick below in FirmSectionView.
+ * `Seçili (N) Ücretlendir` button onClick in FirmSectionView.
  */
 export function FirmOverrideMini({
   accountEuId,
@@ -51,24 +56,29 @@ export function FirmOverrideMini({
 }: FirmOverrideMiniProps) {
   const [rules, setRules] = useState<KeywordOverride[]>([]);
   const [loaded, setLoaded] = useState(false);
-  const [rev, setRev] = useState(0);
   const [draftKw, setDraftKw] = useState("");
 
+  // One-shot load + reactive subscription on the v2 key. We never
+  // depend on `accountEuId` for refetch — a different firm selection
+  // means the parent mounted a different instance, and the subscription
+  // scope (the global overrides.v2 key) is the same regardless.
   useEffect(() => {
     let cancelled = false;
-    loadOverrides()
-      .then((all) => {
-        if (cancelled) return;
-        setRules(
-          all.filter((r) => (r.acntEuId ?? null) === accountEuId),
-        );
-        setLoaded(true);
-      })
-      .catch(() => setLoaded(true));
+    const apply = (list: KeywordOverride[]) => {
+      if (cancelled) return;
+      setRules(list.filter((r) => (r.acntEuId ?? null) === accountEuId));
+      setLoaded(true);
+    };
+    loadOverrides().then(apply).catch(() => setLoaded(true));
+    const off = subscribeStorageKey<unknown>(OVERRIDES_KEY_V2, (next) => {
+      const list = unwrap(next);
+      apply(list);
+    });
     return () => {
       cancelled = true;
+      off();
     };
-  }, [accountEuId, rev]);
+  }, [accountEuId]);
 
   const handleAdd = async () => {
     const kw = draftKw.trim();
@@ -84,13 +94,13 @@ export function FirmOverrideMini({
     all.push(next);
     await saveOverrides(all);
     setDraftKw("");
-    setRev((n) => n + 1);
+    // No setRev here — the subscription fires on storage write and
+    // re-applies the filtered list.
   };
 
   const handleRemove = async (id: string) => {
     const all = await loadOverrides();
     await saveOverrides(all.filter((r) => r.id !== id));
-    setRev((n) => n + 1);
   };
 
   if (!loaded) return null;
@@ -156,4 +166,20 @@ export function FirmOverrideMini({
       </div>
     </div>
   );
+}
+
+// --- helpers ---------------------------------------------------------------
+
+/**
+ * The v2 envelope is `{ version: 2, rules: KeywordOverride[] }`. Older
+ * code paths and tests can still write a bare array (no envelope) —
+ * unwrap defensively so a v1 write doesn't break the mini editor.
+ */
+function unwrap(raw: unknown): KeywordOverride[] {
+  if (raw && typeof raw === "object" && "rules" in raw) {
+    const r = (raw as { rules: unknown }).rules;
+    if (Array.isArray(r)) return r as KeywordOverride[];
+  }
+  if (Array.isArray(raw)) return raw as KeywordOverride[];
+  return [];
 }

@@ -9,6 +9,8 @@ import {
   RefreshCw,
   Save,
   Trash2,
+  Download,
+  Upload,
 } from "lucide-react";
 import { fetchModels } from "../../lib/ai.js";
 import { DEMO_FIXTURE } from "../../lib/api-mock.js";
@@ -19,10 +21,18 @@ import {
   clearSession,
   EMPTY_SESSION,
   loadAudit,
+  loadOverrides,
+  saveOverrides,
   saveSession,
   saveSettings,
   type SessionState,
 } from "../../lib/store.js";
+import {
+  exportOverridesToJson,
+  importOverridesFromJson,
+  formatImportSummary,
+  triggerDownload,
+} from "../../lib/overrideExport.js";
 import type { ModelInfo } from "../../types.js";
 import type { RouteCtx } from "../App.js";
 import { useToast } from "./Toast.js";
@@ -42,6 +52,7 @@ export function StepSettings() {
     message?: string;
   }>({ state: "idle" });
   const harInputRef = useRef<HTMLInputElement>(null);
+  const overridesFileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     loadAudit().then((a) => setAuditCount(a.length));
@@ -260,6 +271,48 @@ export function StepSettings() {
     session.matches !== null ||
     session.customers.length > 0;
 
+  /**
+   * Export the operator's keyword → firm override rules to a JSON file.
+   * Same envelope / file shape as the OverrideEditor's button, so an
+   * export from either surface is importable from the other without
+   * translation. Useful as a backup mechanism or to seed another
+   * machine.
+   */
+  const handleExportOverrides = async () => {
+    const list = await loadOverrides();
+    if (list.length === 0) {
+      toast.push("Dışa aktarılacak kural yok", "info");
+      return;
+    }
+    const envelope = exportOverridesToJson(list);
+    triggerDownload(envelope);
+    toast.push(`${list.length} kural dışa aktarıldı`, "success");
+  };
+
+  const handleImportOverridesClick = () => overridesFileInputRef.current?.click();
+
+  const handleImportOverridesFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const current = await loadOverrides();
+      const summary = importOverridesFromJson(text, current);
+      if (summary.rejected) {
+        toast.push(summary.rejected, "error");
+        return;
+      }
+      await saveOverrides(summary.next);
+      toast.push(formatImportSummary(summary), "success");
+    } catch (err) {
+      toast.push(
+        `İçe aktarma hatası: ${err instanceof Error ? err.message : String(err)}`,
+        "error",
+      );
+    }
+  };
+
   return (
     <div className="section">
       <h2>Bağlantı Ayarları</h2>
@@ -425,6 +478,27 @@ export function StepSettings() {
           >
             <ListChecks size={12} /> Kuralları yönet →
           </button>
+          <button
+            className="ghost sm"
+            onClick={handleExportOverrides}
+            title="Tüm override kurallarını JSON dosyası olarak indir"
+          >
+            <Download size={11} /> JSON indir
+          </button>
+          <button
+            className="ghost sm"
+            onClick={handleImportOverridesClick}
+            title="JSON dosyasından kuralları içe aktar"
+          >
+            <Upload size={11} /> JSON yükle
+          </button>
+          <input
+            ref={overridesFileInputRef}
+            type="file"
+            accept="application/json,.json"
+            style={{ display: "none" }}
+            onChange={handleImportOverridesFile}
+          />
         </div>
       </div>
 

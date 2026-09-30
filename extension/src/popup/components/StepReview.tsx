@@ -12,6 +12,7 @@ import {
   MessageSquare,
   Zap,
   ArrowRight,
+  BookPlus,
 } from "lucide-react";
 import {
   buildKeywordRows,
@@ -29,6 +30,7 @@ import type { Customer, UnmatchedItem } from "../../types.js";
 import { CODEC_ACCOUNT_EU_ID, CODEC_ACCOUNT_NAME } from "../../types.js";
 import type { RouteCtx } from "../App.js";
 import { FirmOverrideMini } from "./FirmOverrideMini.js";
+import { AddRuleInlinePopover } from "./AddRuleInlinePopover.js";
 import { useToast } from "./Toast.js";
 
 type RowFilter = "all" | "high" | "medium" | "low" | "codec";
@@ -1040,6 +1042,7 @@ function FirmSectionView({
   onBulkCopy,
   onRemove,
 }: FirmSectionViewProps) {
+  const toast = useToast();
   const totalIds = section.items.length;
   const allIds = useMemo(
     () => section.items.map((it) => it.transactionId),
@@ -1053,6 +1056,11 @@ function FirmSectionView({
   const txOverridesCount = section.items.filter(
     (it) => it.source === "tx-override",
   ).length;
+
+  // Which row's "save as permanent rule" popover is currently open.
+  // Section-local state so only one row at a time can have a popover,
+  // and navigating between sections naturally closes them all.
+  const [popoverTxId, setPopoverTxId] = useState<number | null>(null);
 
   // --- Per-section pagination ---------------------------------------------
   // Why: see `SECTION_PAGE_SIZE` docstring. We render only the first N
@@ -1229,7 +1237,7 @@ function FirmSectionView({
                     ))}
                   </select>
                 </td>
-                <td className="tx-actions">
+                <td className="tx-actions" style={{ position: "relative" }}>
                   <button
                     className="ghost sm"
                     onClick={() => onCopy(item.transactionId)}
@@ -1246,6 +1254,57 @@ function FirmSectionView({
                   >
                     <X size={10} />
                   </button>
+                  <button
+                    className="ghost sm"
+                    onClick={() =>
+                      setPopoverTxId(
+                        popoverTxId === item.transactionId
+                          ? null
+                          : item.transactionId,
+                      )
+                    }
+                    title={
+                      item.match.confidence === "low"
+                        ? "Sabit kural yap — bu keyword için kalıcı yönlendirme kuralı oluştur"
+                        : "Bu tx için kalıcı keyword→firma kuralı oluştur"
+                    }
+                    aria-label="Kural ekle"
+                    style={
+                      item.match.confidence === "low"
+                        ? { color: "var(--accent)" }
+                        : undefined
+                    }
+                  >
+                    <BookPlus size={10} />
+                    {item.match.confidence === "low" && (
+                      <span
+                        style={{
+                          marginLeft: 4,
+                          fontSize: 10,
+                          fontWeight: 500,
+                        }}
+                      >
+                        Sabit kural yap
+                      </span>
+                    )}
+                  </button>
+                  {popoverTxId === item.transactionId && (
+                    <AddRuleInlinePopover
+                      transactionId={item.transactionId}
+                      matchedField={item.match.matchedField}
+                      matchedValue={item.match.matchedValue}
+                      suggestedAccountName={item.match.suggestedAccountName}
+                      suggestedAccountEuId={item.match.suggestedAccountEuId}
+                      customers={customers}
+                      onSaved={(r) =>
+                        toast.push(
+                          `Kural eklendi: "${r.keywords.join(", ")}" → ${r.accountName}`,
+                          "success",
+                        )
+                      }
+                      onClose={() => setPopoverTxId(null)}
+                    />
+                  )}
                 </td>
               </tr>
             );

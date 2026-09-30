@@ -16,7 +16,14 @@ import {
   clusterByFingerprint,
   expandClusterMatches,
 } from "../../lib/clustering.js";
-import { saveSession, loadOverrides, type SessionState, type ItemSubset } from "../../lib/store.js";
+import {
+  saveSession,
+  loadOverrides,
+  subscribeStorageKey,
+  OVERRIDES_KEY_V2,
+  type SessionState,
+  type ItemSubset,
+} from "../../lib/store.js";
 import type { CategorizeBatchSummary, ItemMatch, KeywordOverride, UnmatchedItem } from "../../types.js";
 import type { RouteCtx } from "../App.js";
 import { useToast } from "./Toast.js";
@@ -111,34 +118,53 @@ export function StepAnalyze() {
     await saveSession(updated);
   };
 
-  // Load operator overrides once on mount and refresh when the customer
-  // list changes (so the resolved acntEuId in the override table reflects
-  // the current session's firms).
+  // Load operator overrides + react to changes from any surface
+  // (OverrideEditor in /fetch, AddRuleInlinePopover in /review, JSON
+  // import in /settings). The previous version reloaded only when
+  // `session.customers.length` changed, which silently dropped edits
+  // made while the analyze screen was already open.
   const [overrides, setOverrides] = useState<KeywordOverride[]>([]);
   useEffect(() => {
     let cancelled = false;
-    (async () => {
-      const list = await loadOverrides();
+    loadOverrides().then((list) => {
+      if (!cancelled) setOverrides(list);
+    });
+    const off = subscribeStorageKey<unknown>(OVERRIDES_KEY_V2, (next) => {
       if (cancelled) return;
-      // Resolve accountName → acntEuId against the current customer list.
-      const norm = (s: string) => s.trim().toLowerCase();
-      const byName = new Map(session.customers.map((c) => [norm(c.name), c.acntEuId]));
-      const resolved = list.map((o) => ({
-        ...o,
-        acntEuId: byName.get(norm(o.accountName)) ?? o.acntEuId ?? null,
-      }));
-      setOverrides(resolved);
-    })();
+      // V2 envelope shape: { version: 2, rules: [...] }. Unwrap defensively
+      // so a v1 legacy write (bare array) doesn't crash the screen.
+      if (next && typeof next === "object" && "rules" in next) {
+        setOverrides((next as { rules: KeywordOverride[] }).rules);
+      } else if (Array.isArray(next)) {
+        setOverrides(next as KeywordOverride[]);
+      }
+    });
     return () => {
       cancelled = true;
+      off();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session.customers.length]);
+  }, []);
+
+  // Re-resolve `accountName → acntEuId` whenever either the override
+  // list or the customer list changes. Pure derivation — no extra IO.
+  const resolvedOverrides = useMemo(() => {
+    const norm = (s: string) => s.trim().toLowerCase();
+    const byName = new Map(
+      session.customers.map((c) => [norm(c.name), c.acntEuId]),
+    );
+    return overrides.map((o) => ({
+      ...o,
+      acntEuId: byName.get(norm(o.accountName)) ?? o.acntEuId ?? null,
+    }));
+  }, [overrides, session.customers]);
 
   /** Override rules that actually have a keyword list (skip empty rows). */
   const activeOverrides = useMemo(
-    () => overrides.filter((o) => o.keywords.length > 0 && o.accountName.trim()),
-    [overrides],
+    () =>
+      resolvedOverrides.filter(
+        (o) => o.keywords.length > 0 && o.accountName.trim(),
+      ),
+    [resolvedOverrides],
   );
 
   const run = async () => {
