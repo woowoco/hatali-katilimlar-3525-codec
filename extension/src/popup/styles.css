@@ -1918,22 +1918,35 @@ label:first-child {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--bg-1);
+  /* Let inner flex children shrink below their content size — without
+     this, long firm names overflow the card horizontally and clip the
+     mode/pill/delete controls. */
+  min-width: 0;
 }
 
 .firm-rule-card__top {
   display: flex;
+  flex-wrap: wrap;
+  /* Header row layout: firm name always spans the full width on its
+     own line so a long firm name never gets clipped. Mode + pill(s)
+     + delete wrap to a second row when space is tight. */
   align-items: center;
   gap: 6px;
 }
 
 .firm-rule-card__firm {
-  flex: 1;
+  /* `flex: 1 1 100%` forces a new row; `min-width: 0` lets the input
+     shrink to its parent instead of overflowing horizontally. */
+  flex: 1 1 100%;
+  min-width: 0;
   padding: 4px 6px;
   border: 1px solid var(--border);
   border-radius: 4px;
   background: var(--bg-2);
   color: var(--text-1);
   font-size: 12px;
+  /* Make placeholder + value behave inside the constrained box. */
+  text-overflow: ellipsis;
 }
 
 .firm-rule-card__mode {
@@ -1943,6 +1956,8 @@ label:first-child {
   background: var(--bg-2);
   color: var(--text-1);
   font-size: 11px;
+  /* Mod dropdown must keep a usable inline size, never stretch. */
+  flex: 0 0 auto;
 }
 
 .firm-rule-card__chips {
@@ -1951,16 +1966,23 @@ label:first-child {
   gap: 4px;
   padding: 4px 2px;
   min-height: 22px;
+  min-width: 0;
 }
 
 .firm-rule-card__add {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
 }
 
 .firm-rule-card__add input[type="text"] {
-  flex: 1;
+  /* Input takes whatever room is left; min-width keeps it from
+     collapsing below 140px (smaller than that and operators can't
+     read what they typed). On narrow viewports it falls back to a
+     full-width row, with the Ekle button wrapping below. */
+  flex: 1 1 140px;
+  min-width: 0;
   padding: 4px 6px;
   border: 1px solid var(--border);
   border-radius: 4px;
@@ -1972,11 +1994,15 @@ label:first-child {
 
 .firm-rule-card__meta {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
 }
 
 .firm-rule-card__notes {
-  flex: 1;
+  /* Notes get whatever space is left after the mode on the first row,
+     and full width when there's nothing else to share with. */
+  flex: 1 1 200px;
+  min-width: 0;
   padding: 4px 6px;
   border: 1px solid var(--border);
   border-radius: 4px;
@@ -2006,6 +2032,10 @@ label:first-child {
   color: var(--danger, #ff6b6b);
   font-size: 10px;
   line-height: 1.4;
+  /* Long Turkish warning text (e.g. firm-not-found) must wrap inside
+     the card instead of overflowing horizontally. */
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .firm-rule-card .pill.warn {
@@ -2014,6 +2044,7 @@ label:first-child {
   border-radius: 999px;
   background: rgba(255, 165, 0, 0.15);
   color: #ffa500;
+  flex: 0 0 auto;
 }
 
 .firm-rule-card .pill.success {
@@ -2022,6 +2053,18 @@ label:first-child {
   border-radius: 999px;
   background: rgba(91, 200, 120, 0.15);
   color: var(--success, #5bc878);
+  flex: 0 0 auto;
+}
+
+.firm-rule-card .pill {
+  flex: 0 0 auto;
+}
+
+.firm-rule-card__top > button {
+  /* Delete button stays a fixed-size square in the top-right; pushes
+     to its own row on the narrowest viewports if needed. */
+  flex: 0 0 auto;
+  margin-left: auto;
 }
 
 /* Keyword chip — a single keyword bound to its parent rule. Hover lifts
@@ -2037,6 +2080,9 @@ label:first-child {
   font-size: 11px;
   line-height: 1.4;
   transition: background 0.12s ease;
+  /* Long keywords wrap instead of overflowing horizontally. */
+  max-width: 100%;
+  min-width: 0;
 }
 
 .chip:hover {
@@ -2045,6 +2091,11 @@ label:first-child {
 
 .chip__label {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  /* Keyword text wraps inside the chip when a single keyword exceeds
+     the available width — better than horizontal scroll on a chip. */
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  min-width: 0;
 }
 
 .chip__x {
@@ -2059,11 +2110,86 @@ label:first-child {
   background: transparent;
   color: var(--muted, #888);
   cursor: pointer;
+  flex: 0 0 auto;
 }
 
 .chip__x:hover {
   background: var(--danger, #ff6b6b);
   color: #fff;
+}
+
+/* --------------------------------------------------------------------------
+   Override editor — header toolbar and search row.
+   Toolbar buttons + counters wrap to additional lines when the popup is
+   narrow (Chrome MV3 popups run as narrow as ~340px in some locales).
+   -------------------------------------------------------------------------- */
+
+.override-editor__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.override-editor__head h3 {
+  flex: 1 1 100%;
+  /* Title on its own line so the count + buttons always fit. */
+  margin: 0 0 4px 0;
+}
+
+.override-editor__head > span.muted {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.override-editor__head > button {
+  flex: 0 0 auto;
+}
+
+.override-editor__rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.override-editor__search-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.override-editor__search-row > .override-editor__search-wrap {
+  /* Search box takes whatever room is left; counter pill pushes to a
+     second line when space is tight. */
+  position: relative;
+  flex: 1 1 200px;
+  min-width: 0;
+}
+
+.override-editor__search-row > .override-editor__search-wrap input {
+  width: 100%;
+  min-width: 0;
+}
+
+.override-editor__search-row > span.muted {
+  flex: 0 0 auto;
+}
+
+.override-editor__action-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.override-editor__action-row > button {
+  flex: 0 0 auto;
+}
+
+.override-editor__action-row > span.muted {
+  flex: 0 0 auto;
 }
 
 /* ==========================================================================

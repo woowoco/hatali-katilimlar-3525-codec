@@ -427,8 +427,8 @@ export function OverrideEditor({
       </p>
 
       {/* F2: search filter + F3: dup detection */}
-      <div className="row" style={{ marginTop: 6, gap: 8 }}>
-        <div style={{ position: "relative", flex: 1 }}>
+      <div className="override-editor__search-row" style={{ marginTop: 6 }}>
+        <div className="override-editor__search-wrap">
           <Search
             size={11}
             style={{
@@ -584,7 +584,7 @@ export function OverrideEditor({
         ))}
       </div>
 
-      <div className="row" style={{ marginTop: 10, gap: 8, flexWrap: "wrap" }}>
+      <div className="override-editor__action-row" style={{ marginTop: 10 }}>
         <button onClick={addEmptyRule}>
           <Plus size={11} /> Yeni kural
         </button>
